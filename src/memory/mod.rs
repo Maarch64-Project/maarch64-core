@@ -97,15 +97,15 @@ impl MemoryManager {
             .map_err(|e| crate::Error::MemoryError(e.to_string()))?
         };
 
-        let actual_addr = ptr.as_ptr() as u64;
+        let segment_virt_addr = if target_addr != 0 { target_addr } else { ptr.as_ptr() as u64 };
         self.segments.push(MemorySegment {
-            addr: actual_addr,
+            addr: segment_virt_addr,
             size,
             prot,
             ptr,
         });
 
-        Ok(actual_addr)
+        Ok(segment_virt_addr)
     }
 
     pub fn mprotect(&mut self, addr: u64, size: usize, prot: ProtFlags) -> Result<()> {
