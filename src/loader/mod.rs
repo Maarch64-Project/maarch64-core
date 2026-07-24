@@ -15,6 +15,15 @@ impl ElfLoader {
         path: P,
         mem: &mut MemoryManager,
     ) -> Result<LoadedBinary> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        Self::load_file_with_args(path, &[&path_str], mem)
+    }
+
+    pub fn load_file_with_args<P: AsRef<Path>>(
+        path: P,
+        args: &[&str],
+        mem: &mut MemoryManager,
+    ) -> Result<LoadedBinary> {
         let data = std::fs::read(&path)
             .map_err(|e| crate::Error::LoadError(format!("Failed to read file: {}", e)))?;
         
@@ -66,8 +75,17 @@ impl ElfLoader {
         let stack_base = stack_top - (stack_size as u64);
         mem.map_anonymous(stack_base, stack_size)?;
 
-        // Set up initial stack with POSIX Auxv vectors
         let mut sp = stack_top - 0x1000;
+
+        // Push argument strings onto stack
+        let mut arg_ptrs = Vec::new();
+        for arg in args {
+            let bytes = arg.as_bytes();
+            sp -= (bytes.len() + 1) as u64; // +1 for null terminator
+            mem.write(sp, bytes)?;
+            mem.write(sp + bytes.len() as u64, &[0u8])?;
+            arg_ptrs.push(sp);
+        }
 
         // Push 16 random bytes for AT_RANDOM
         sp -= 16;
@@ -98,13 +116,20 @@ impl ElfLoader {
         sp -= 8;
         mem.write(sp, &0u64.to_le_bytes())?;
 
-        // argv (null)
+        // argv null terminator
         sp -= 8;
         mem.write(sp, &0u64.to_le_bytes())?;
 
-        // argc = 0
+        // argv pointers in reverse order
+        for &ptr in arg_ptrs.iter().rev() {
+            sp -= 8;
+            mem.write(sp, &ptr.to_le_bytes())?;
+        }
+
+        // argc
         sp -= 8;
-        mem.write(sp, &0u64.to_le_bytes())?;
+        let argc = arg_ptrs.len() as u64;
+        mem.write(sp, &argc.to_le_bytes())?;
 
         Ok(LoadedBinary {
             entry_point,

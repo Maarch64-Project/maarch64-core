@@ -349,7 +349,10 @@ impl Interpreter {
                 SyscallDispatcher::handle_syscall(ctx, mem)?;
             }
             _ => {
-                tracing::warn!("Unimplemented opcode at {:#x}: {:?}", pc, inst);
+                return Err(crate::Error::InterpreterError {
+                    pc,
+                    reason: format!("Unimplemented opcode {:?}", inst.op()),
+                });
             }
         }
 

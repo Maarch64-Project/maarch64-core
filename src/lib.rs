@@ -19,6 +19,8 @@ pub enum Error {
     DecodeError { pc: u64, reason: String },
     #[error("Unhandled syscall number: {0}")]
     UnhandledSyscall(u64),
+    #[error("Interpreter error at PC {pc:#x}: {reason}")]
+    InterpreterError { pc: u64, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
