@@ -1,0 +1,15 @@
+[package]
+name = "maarch64-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core CPU emulator, ELF loader, and instruction translator for Maarch64"
+
+[dependencies]
+object.workspace = true
+nix.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bad64.workspace = true
