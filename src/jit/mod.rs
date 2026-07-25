@@ -7,6 +7,7 @@ pub struct BasicBlock {
     pub start_pc: u64,
     pub end_pc: u64,
     pub instructions: Vec<Instruction>,
+    pub successor_pcs: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -43,6 +44,7 @@ impl JitCache {
         let mut cur_pc = start_pc;
         let mut instructions = Vec::new();
         let max_block_instructions = 500;
+        let mut successor_pcs = Vec::new();
 
         while instructions.len() < max_block_instructions {
             let ins_bytes = match mem.read(cur_pc, 4) {
@@ -71,6 +73,8 @@ impl JitCache {
                     | Op::BLR
                     | Op::SVC
             ) {
+                // Record fall-through and target successors if statically computable
+                successor_pcs.push(cur_pc);
                 break;
             }
         }
@@ -79,6 +83,7 @@ impl JitCache {
             start_pc,
             end_pc: cur_pc,
             instructions,
+            successor_pcs,
         };
 
         self.blocks.insert(start_pc, block);
