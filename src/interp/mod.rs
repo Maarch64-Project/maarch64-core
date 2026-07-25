@@ -59,8 +59,24 @@ fn imm_to_i64(imm: &bad64::Imm) -> i64 {
     }
 }
 
+fn is_w_reg(reg: Reg) -> bool {
+    matches!(
+        reg,
+        Reg::W0 | Reg::W1 | Reg::W2 | Reg::W3 | Reg::W4 | Reg::W5 | Reg::W6 | Reg::W7 |
+        Reg::W8 | Reg::W9 | Reg::W10 | Reg::W11 | Reg::W12 | Reg::W13 | Reg::W14 | Reg::W15 |
+        Reg::W16 | Reg::W17 | Reg::W18 | Reg::W19 | Reg::W20 | Reg::W21 | Reg::W22 | Reg::W23 |
+        Reg::W24 | Reg::W25 | Reg::W26 | Reg::W27 | Reg::W28 | Reg::W29 | Reg::W30 | Reg::WZR
+    )
+}
+
 fn get_reg_val(reg: Reg, ctx: &CpuContext) -> u64 {
-    if let Some(idx) = reg_idx(reg) {
+    if is_w_reg(reg) {
+        if let Some(idx) = reg_idx(reg) {
+            ctx.get_x(idx) & 0xFFFF_FFFF
+        } else {
+            0
+        }
+    } else if let Some(idx) = reg_idx(reg) {
         ctx.get_x(idx)
     } else if reg == Reg::SP {
         ctx.sp
@@ -70,7 +86,11 @@ fn get_reg_val(reg: Reg, ctx: &CpuContext) -> u64 {
 }
 
 fn set_reg_val(reg: Reg, val: u64, ctx: &mut CpuContext) {
-    if let Some(idx) = reg_idx(reg) {
+    if is_w_reg(reg) {
+        if let Some(idx) = reg_idx(reg) {
+            ctx.set_x(idx, val & 0xFFFF_FFFF);
+        }
+    } else if let Some(idx) = reg_idx(reg) {
         ctx.set_x(idx, val);
     } else if reg == Reg::SP {
         ctx.sp = val;
@@ -481,14 +501,26 @@ impl Interpreter {
                     if let Operand::Cond(cond) = ops[3] {
                         let cond_holds = eval_cond(&cond, ctx);
                         if cond_holds {
-                            let v1 = get_operand_val(&ops[0], ctx);
-                            let v2 = get_operand_val(&ops[1], ctx);
-                            let (res, borrow) = v1.overflowing_sub(v2);
-                            let n = (res as i64) < 0;
-                            let z = res == 0;
-                            let c = !borrow;
-                            let v = ((v1 ^ v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
-                            ctx.set_nzcv(n, z, c, v);
+                            let is_32 = matches!(ops[0], Operand::Reg { reg, .. } if is_w_reg(reg));
+                            if is_32 {
+                                let v1 = get_operand_val(&ops[0], ctx) as u32;
+                                let v2 = get_operand_val(&ops[1], ctx) as u32;
+                                let (res, borrow) = v1.overflowing_sub(v2);
+                                let n = (res as i32) < 0;
+                                let z = res == 0;
+                                let c = !borrow;
+                                let v = ((v1 ^ v2) & (v1 ^ res) & 0x8000_0000) != 0;
+                                ctx.set_nzcv(n, z, c, v);
+                            } else {
+                                let v1 = get_operand_val(&ops[0], ctx);
+                                let v2 = get_operand_val(&ops[1], ctx);
+                                let (res, borrow) = v1.overflowing_sub(v2);
+                                let n = (res as i64) < 0;
+                                let z = res == 0;
+                                let c = !borrow;
+                                let v = ((v1 ^ v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
+                                ctx.set_nzcv(n, z, c, v);
+                            }
                         } else {
                             let flags_raw = get_operand_val(&ops[2], ctx) as u32;
                             let n = (flags_raw & 8) != 0;
