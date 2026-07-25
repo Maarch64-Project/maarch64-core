@@ -461,6 +461,20 @@ impl Interpreter {
                     }
                 }
             }
+            Op::CSET | Op::CSETM => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let (Operand::Reg { reg: rd, .. }, Operand::Cond(cond)) = (ops[0], ops[1]) {
+                        let cond_holds = eval_cond(&cond, ctx);
+                        let res = if cond_holds {
+                            if inst.op() == Op::CSETM { !0u64 } else { 1u64 }
+                        } else {
+                            0u64
+                        };
+                        set_reg_val(rd, res, ctx);
+                    }
+                }
+            }
             Op::CCMP | Op::CCMN => {
                 let ops = inst.operands();
                 if ops.len() >= 4 {
@@ -528,6 +542,90 @@ impl Interpreter {
                         let v1 = get_operand_val(&ops[1], ctx);
                         let v2 = get_operand_val(&ops[2], ctx);
                         set_reg_val(reg, v1 & v2, ctx);
+                    }
+                }
+            }
+            Op::TST => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let v1 = get_operand_val(&ops[0], ctx);
+                    let v2 = get_operand_val(&ops[1], ctx);
+                    let res = v1 & v2;
+                    let n = (res as i64) < 0;
+                    let z = res == 0;
+                    ctx.set_nzcv(n, z, false, false);
+                }
+            }
+            Op::BIC => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let v2 = get_operand_val(&ops[2], ctx);
+                        set_reg_val(reg, v1 & !v2, ctx);
+                    }
+                }
+            }
+            Op::MVN => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        set_reg_val(reg, !v1, ctx);
+                    }
+                }
+            }
+            Op::UBFIZ => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let lsb = get_operand_val(&ops[2], ctx);
+                        let width = get_operand_val(&ops[3], ctx);
+                        let mask = if width >= 64 { !0u64 } else { (1u64 << width) - 1 };
+                        set_reg_val(reg, (v1 & mask) << lsb, ctx);
+                    }
+                }
+            }
+            Op::UBFX => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let lsb = get_operand_val(&ops[2], ctx);
+                        let width = get_operand_val(&ops[3], ctx);
+                        let mask = if width >= 64 { !0u64 } else { (1u64 << width) - 1 };
+                        set_reg_val(reg, (v1 >> lsb) & mask, ctx);
+                    }
+                }
+            }
+            Op::LSL => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let shift = get_operand_val(&ops[2], ctx) as u32;
+                        set_reg_val(reg, v1.wrapping_shl(shift), ctx);
+                    }
+                }
+            }
+            Op::LSR => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let shift = get_operand_val(&ops[2], ctx) as u32;
+                        set_reg_val(reg, v1.wrapping_shr(shift), ctx);
+                    }
+                }
+            }
+            Op::ASR => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let shift = get_operand_val(&ops[2], ctx) as u32;
+                        set_reg_val(reg, ((v1 as i64) >> shift) as u64, ctx);
                     }
                 }
             }
