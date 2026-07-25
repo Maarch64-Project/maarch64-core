@@ -552,6 +552,32 @@ impl Interpreter {
         Ok(true)
     }
 
+    pub fn step_with_thunk_lookup<F>(
+        ctx: &mut CpuContext,
+        mem: &mut MemoryManager,
+        thunk_lookup: F,
+    ) -> Result<bool>
+    where
+        F: Fn(u64) -> Option<fn(&mut CpuContext, &mut MemoryManager) -> std::result::Result<(), String>>,
+    {
+        if ctx.exited {
+            return Ok(false);
+        }
+
+        let pc = ctx.pc;
+        if let Some(thunk_fn) = thunk_lookup(pc) {
+            thunk_fn(ctx, mem).map_err(|e| crate::Error::InterpreterError {
+                pc,
+                reason: format!("Thunk execution error at PC {:#x}: {}", pc, e),
+            })?;
+            let lr = ctx.get_x(30);
+            ctx.pc = lr;
+            return Ok(!ctx.exited);
+        }
+
+        Self::step(ctx, mem)
+    }
+
     pub fn run(ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<()> {
         while Interpreter::step(ctx, mem)? {}
         Ok(())
