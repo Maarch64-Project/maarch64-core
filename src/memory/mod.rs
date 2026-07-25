@@ -157,9 +157,10 @@ impl MemoryManager {
                 return Ok(());
             }
         }
+        let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
         Err(crate::Error::MemoryError(format!(
-            "Address {:#x} out of mapped memory bounds",
-            addr
+            "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
+            addr, data.len(), seg_info
         )))
     }
 
@@ -170,9 +171,10 @@ impl MemoryManager {
                 return Ok(&seg.as_slice()[offset..offset + len]);
             }
         }
+        let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
         Err(crate::Error::MemoryError(format!(
-            "Address {:#x} out of mapped memory bounds",
-            addr
+            "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
+            addr, len, seg_info
         )))
     }
 
@@ -187,5 +189,19 @@ impl MemoryManager {
             "Address {:#x} out of mapped memory bounds",
             addr
         )))
+    }
+
+    pub fn read_string(&self, addr: u64) -> Result<Vec<u8>> {
+        let mut cur = addr;
+        let mut bytes = Vec::new();
+        loop {
+            let b = self.read(cur, 1)?[0];
+            if b == 0 {
+                break;
+            }
+            bytes.push(b);
+            cur += 1;
+        }
+        Ok(bytes)
     }
 }

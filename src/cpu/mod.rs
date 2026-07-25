@@ -11,6 +11,12 @@ pub struct CpuContext {
     pub pstate: u32,
     /// Floating point / SIMD registers V0..V31 (128-bit each)
     pub v: [[u8; 16]; 32],
+    /// Thread ID / Thread Local Storage register (TPIDR_EL0)
+    pub tpidr_el0: u64,
+    /// Process exit flag
+    pub exited: bool,
+    /// Process exit status code
+    pub exit_code: i32,
 }
 
 pub const FLAG_N: u32 = 1 << 31;

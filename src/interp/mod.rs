@@ -87,6 +87,34 @@ fn get_operand_val(op: &Operand, ctx: &CpuContext) -> u64 {
     }
 }
 
+fn shift_val(shift: Option<&bad64::Shift>) -> u32 {
+    match shift {
+        Some(bad64::Shift::LSL(amt)) | Some(bad64::Shift::LSR(amt)) | Some(bad64::Shift::ASR(amt)) | Some(bad64::Shift::ROR(amt)) => *amt as u32,
+        _ => 0,
+    }
+}
+
+fn eval_cond<T: std::fmt::Debug>(cond: &T, ctx: &CpuContext) -> bool {
+    let cond_str = format!("{:?}", cond);
+    match cond_str.as_str() {
+        "EQ" => ctx.get_z(),
+        "NE" => !ctx.get_z(),
+        "CS" | "HS" => ctx.get_c(),
+        "CC" | "LO" => !ctx.get_c(),
+        "MI" => ctx.get_n(),
+        "PL" => !ctx.get_n(),
+        "VS" => ctx.get_v(),
+        "VC" => !ctx.get_v(),
+        "HI" => ctx.get_c() && !ctx.get_z(),
+        "LS" => !ctx.get_c() || ctx.get_z(),
+        "GE" => ctx.get_n() == ctx.get_v(),
+        "LT" => ctx.get_n() != ctx.get_v(),
+        "GT" => !ctx.get_z() && (ctx.get_n() == ctx.get_v()),
+        "LE" => ctx.get_z() || (ctx.get_n() != ctx.get_v()),
+        _ => true,
+    }
+}
+
 fn eval_mem_addr(op: &Operand, ctx: &mut CpuContext) -> Option<u64> {
     match op {
         Operand::MemOffset { reg, offset, .. } => {
@@ -113,17 +141,79 @@ fn eval_mem_addr(op: &Operand, ctx: &mut CpuContext) -> Option<u64> {
     }
 }
 
+fn m_err(pc: u64, e: crate::Error) -> crate::Error {
+    crate::Error::InterpreterError {
+        pc,
+        reason: format!("Memory error at PC {:#x}: {}", pc, e),
+    }
+}
+
 impl Interpreter {
     pub fn step(ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<bool> {
-        let pc = ctx.pc;
-        let code_bytes = mem.read(pc, 4)?;
-        let opcode = u32::from_le_bytes(code_bytes.try_into().unwrap());
+        if ctx.exited {
+            return Ok(false);
+        }
 
-        let inst = Decoder::decode(opcode, pc)?;
+        let pc = ctx.pc;
+        let ins_bytes = mem.read(pc, 4).map_err(|e| m_err(pc, e))?;
+        let ins_u32 = u32::from_le_bytes(ins_bytes.try_into().unwrap());
+
+        let inst = Decoder::decode(ins_u32, pc).map_err(|e| crate::Error::DecodeError {
+            pc,
+            reason: e.to_string(),
+        })?;
+
         let mut next_pc = pc + 4;
 
         match inst.op() {
-            Op::MOV | Op::MOVZ => {
+            Op::ADD | Op::ADDS => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    let v1 = get_operand_val(&ops[1], ctx);
+                    let v2 = get_operand_val(&ops[2], ctx);
+                    let (res, overflow) = v1.overflowing_add(v2);
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        set_reg_val(reg, res, ctx);
+                    }
+                    if inst.op() == Op::ADDS {
+                        let n = (res as i64) < 0;
+                        let z = res == 0;
+                        let c = overflow;
+                        let v = ((v1 ^ !v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
+                        ctx.set_nzcv(n, z, c, v);
+                    }
+                }
+            }
+            Op::SUB | Op::SUBS | Op::CMP => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let (op1, op2) = if inst.op() == Op::CMP {
+                        (&ops[0], &ops[1])
+                    } else if ops.len() >= 3 {
+                        (&ops[1], &ops[2])
+                    } else {
+                        (&ops[0], &ops[1])
+                    };
+                    let v1 = get_operand_val(op1, ctx);
+                    let v2 = get_operand_val(op2, ctx);
+                    let (res, borrow) = v1.overflowing_sub(v2);
+
+                    if inst.op() != Op::CMP && ops.len() >= 3 {
+                        if let Operand::Reg { reg, .. } = ops[0] {
+                            set_reg_val(reg, res, ctx);
+                        }
+                    }
+
+                    if inst.op() == Op::SUBS || inst.op() == Op::CMP {
+                        let n = (res as i64) < 0;
+                        let z = res == 0;
+                        let c = !borrow;
+                        let v = ((v1 ^ v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
+                        ctx.set_nzcv(n, z, c, v);
+                    }
+                }
+            }
+            Op::MOV => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     if let Operand::Reg { reg, .. } = ops[0] {
@@ -132,48 +222,48 @@ impl Interpreter {
                     }
                 }
             }
-            Op::ADD => {
-                let ops = inst.operands();
-                if ops.len() >= 3 {
-                    if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
-                        let res = v1.wrapping_add(v2);
-                        set_reg_val(reg, res, ctx);
-                    }
-                }
-            }
-            Op::SUB => {
-                let ops = inst.operands();
-                if ops.len() >= 3 {
-                    if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
-                        let res = v1.wrapping_sub(v2);
-                        set_reg_val(reg, res, ctx);
-                    }
-                }
-            }
-            Op::CMP => {
+            Op::MOVK => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
-                    let v1 = get_operand_val(&ops[0], ctx);
-                    let v2 = get_operand_val(&ops[1], ctx);
-                    let res = v1.wrapping_sub(v2);
-                    let n = (res as i64) < 0;
-                    let z = res == 0;
-                    let c = v1 >= v2;
-                    let v = ((v1 ^ v2) & (v1 ^ res)) >> 63 != 0;
-                    ctx.set_nzcv(n, z, c, v);
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let imm = get_operand_val(&ops[1], ctx) & 0xffff;
+                        let s_val = if let Operand::Imm64 { shift, .. } = ops[1] {
+                            shift_val(shift.as_ref())
+                        } else if let Operand::Imm32 { shift, .. } = ops[1] {
+                            shift_val(shift.as_ref())
+                        } else {
+                            0
+                        };
+                        let cur_val = get_reg_val(reg, ctx);
+                        let mask = !(0xffffu64 << s_val);
+                        let new_val = (cur_val & mask) | (imm << s_val);
+                        set_reg_val(reg, new_val, ctx);
+                    }
+                }
+            }
+            Op::MOVN => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        let imm = get_operand_val(&ops[1], ctx) & 0xffff;
+                        let s_val = if let Operand::Imm64 { shift, .. } = ops[1] {
+                            shift_val(shift.as_ref())
+                        } else if let Operand::Imm32 { shift, .. } = ops[1] {
+                            shift_val(shift.as_ref())
+                        } else {
+                            0
+                        };
+                        let val = !(imm << s_val);
+                        set_reg_val(reg, val, ctx);
+                    }
                 }
             }
             Op::ADRP => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let label_addr = get_operand_val(&ops[1], ctx);
-                        let page_addr = label_addr & !0xfff;
-                        set_reg_val(reg, page_addr, ctx);
+                        let target_addr = get_operand_val(&ops[1], ctx);
+                        set_reg_val(reg, target_addr & !0xfff, ctx);
                     }
                 }
             }
@@ -202,67 +292,93 @@ impl Interpreter {
                         Op::B_LT => ctx.get_n() != ctx.get_v(),
                         Op::B_GT => !ctx.get_z() && (ctx.get_n() == ctx.get_v()),
                         Op::B_LE => ctx.get_z() || (ctx.get_n() != ctx.get_v()),
-                        _ => true,
+                        _ => false,
                     };
                     if cond_holds {
-                        next_pc = get_operand_val(&ops[0], ctx);
+                        let target_addr = get_operand_val(&ops[0], ctx);
+                        next_pc = target_addr;
+                    }
+                }
+            }
+            Op::CBZ | Op::CBNZ => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let reg_val = get_operand_val(&ops[0], ctx);
+                    let is_zero = reg_val == 0;
+                    let should_branch = match inst.op() {
+                        Op::CBZ => is_zero,
+                        Op::CBNZ => !is_zero,
+                        _ => false,
+                    };
+                    if should_branch {
+                        let target_addr = get_operand_val(&ops[1], ctx);
+                        next_pc = target_addr;
                     }
                 }
             }
             Op::BL => {
                 let ops = inst.operands();
                 if !ops.is_empty() {
+                    ctx.set_x(30, pc + 4);
                     let target_addr = get_operand_val(&ops[0], ctx);
-                    ctx.set_x(30, pc + 4); // X30 (LR)
                     next_pc = target_addr;
                 }
             }
             Op::RET => {
-                let ops = inst.operands();
-                if ops.is_empty() {
-                    next_pc = ctx.get_x(30);
-                } else if let Operand::Reg { reg, .. } = ops[0] {
-                    next_pc = get_reg_val(reg, ctx);
-                }
+                let ret_addr = ctx.get_x(30);
+                next_pc = ret_addr;
             }
-            Op::CBZ => {
-                let ops = inst.operands();
-                if ops.len() >= 2 {
-                    let val = get_operand_val(&ops[0], ctx);
-                    let target_addr = get_operand_val(&ops[1], ctx);
-                    if val == 0 {
-                        next_pc = target_addr;
-                    }
-                }
-            }
-            Op::CBNZ => {
-                let ops = inst.operands();
-                if ops.len() >= 2 {
-                    let val = get_operand_val(&ops[0], ctx);
-                    let target_addr = get_operand_val(&ops[1], ctx);
-                    if val != 0 {
-                        next_pc = target_addr;
-                    }
-                }
-            }
-            Op::LDR => {
+            Op::LDR | Op::LDUR => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     if let Operand::Reg { reg, .. } = ops[0] {
                         if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
-                            let val_bytes = mem.read(addr, 8)?;
+                            let val_bytes = mem.read(addr, 8).map_err(|e| m_err(pc, e))?;
                             let val = u64::from_le_bytes(val_bytes.try_into().unwrap());
                             set_reg_val(reg, val, ctx);
                         }
                     }
                 }
             }
-            Op::STR => {
+            Op::LDRH => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
+                            let val_bytes = mem.read(addr, 2).map_err(|e| m_err(pc, e))?;
+                            let val = u16::from_le_bytes(val_bytes.try_into().unwrap()) as u64;
+                            set_reg_val(reg, val, ctx);
+                        }
+                    }
+                }
+            }
+            Op::LDRSH => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
+                            let val_bytes = mem.read(addr, 2).map_err(|e| m_err(pc, e))?;
+                            let val = i16::from_le_bytes(val_bytes.try_into().unwrap()) as i64 as u64;
+                            set_reg_val(reg, val, ctx);
+                        }
+                    }
+                }
+            }
+            Op::STR | Op::STUR => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     let val = get_operand_val(&ops[0], ctx);
                     if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
-                        mem.write(addr, &val.to_le_bytes())?;
+                        mem.write(addr, &val.to_le_bytes()).map_err(|e| m_err(pc, e))?;
+                    }
+                }
+            }
+            Op::STRH => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let val = get_operand_val(&ops[0], ctx) as u16;
+                    if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
+                        mem.write(addr, &val.to_le_bytes()).map_err(|e| m_err(pc, e))?;
                     }
                 }
             }
@@ -272,8 +388,8 @@ impl Interpreter {
                     let v1 = get_operand_val(&ops[0], ctx);
                     let v2 = get_operand_val(&ops[1], ctx);
                     if let Some(addr) = eval_mem_addr(&ops[2], ctx) {
-                        mem.write(addr, &v1.to_le_bytes())?;
-                        mem.write(addr + 8, &v2.to_le_bytes())?;
+                        mem.write(addr, &v1.to_le_bytes()).map_err(|e| m_err(pc, e))?;
+                        mem.write(addr + 8, &v2.to_le_bytes()).map_err(|e| m_err(pc, e))?;
                     }
                 }
             }
@@ -282,9 +398,9 @@ impl Interpreter {
                 if ops.len() >= 3 {
                     if let (Operand::Reg { reg: r1, .. }, Operand::Reg { reg: r2, .. }) = (&ops[0], &ops[1]) {
                         if let Some(addr) = eval_mem_addr(&ops[2], ctx) {
-                            let b1 = mem.read(addr, 8)?;
+                            let b1 = mem.read(addr, 8).map_err(|e| m_err(pc, e))?;
                             let v1 = u64::from_le_bytes(b1.try_into().unwrap());
-                            let b2 = mem.read(addr + 8, 8)?;
+                            let b2 = mem.read(addr + 8, 8).map_err(|e| m_err(pc, e))?;
                             let v2 = u64::from_le_bytes(b2.try_into().unwrap());
                             set_reg_val(*r1, v1, ctx);
                             set_reg_val(*r2, v2, ctx);
@@ -297,8 +413,20 @@ impl Interpreter {
                 if ops.len() >= 2 {
                     if let Operand::Reg { reg, .. } = ops[0] {
                         if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
-                            let b = mem.read(addr, 1)?;
+                            let b = mem.read(addr, 1).map_err(|e| m_err(pc, e))?;
                             set_reg_val(reg, b[0] as u64, ctx);
+                        }
+                    }
+                }
+            }
+            Op::LDRSB => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
+                            let b = mem.read(addr, 1).map_err(|e| m_err(pc, e))?;
+                            let val = (b[0] as i8) as i64 as u64;
+                            set_reg_val(reg, val, ctx);
                         }
                     }
                 }
@@ -308,8 +436,69 @@ impl Interpreter {
                 if ops.len() >= 2 {
                     let val = get_operand_val(&ops[0], ctx) as u8;
                     if let Some(addr) = eval_mem_addr(&ops[1], ctx) {
-                        mem.write(addr, &[val])?;
+                        mem.write(addr, &[val]).map_err(|e| m_err(pc, e))?;
                     }
+                }
+            }
+            Op::CSEL | Op::CSINC | Op::CSINV | Op::CSNEG => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let (Operand::Reg { reg: rd, .. }, Operand::Cond(cond)) = (ops[0], ops[3]) {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let v2 = get_operand_val(&ops[2], ctx);
+                        let cond_holds = eval_cond(&cond, ctx);
+                        let res = if cond_holds {
+                            v1
+                        } else {
+                            match inst.op() {
+                                Op::CSINC => v2.wrapping_add(1),
+                                Op::CSINV => !v2,
+                                Op::CSNEG => (-(v2 as i64)) as u64,
+                                _ => v2,
+                            }
+                        };
+                        set_reg_val(rd, res, ctx);
+                    }
+                }
+            }
+            Op::CCMP | Op::CCMN => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let Operand::Cond(cond) = ops[3] {
+                        let cond_holds = eval_cond(&cond, ctx);
+                        if cond_holds {
+                            let v1 = get_operand_val(&ops[0], ctx);
+                            let v2 = get_operand_val(&ops[1], ctx);
+                            let (res, borrow) = v1.overflowing_sub(v2);
+                            let n = (res as i64) < 0;
+                            let z = res == 0;
+                            let c = !borrow;
+                            let v = ((v1 ^ v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
+                            ctx.set_nzcv(n, z, c, v);
+                        } else {
+                            let flags_raw = get_operand_val(&ops[2], ctx) as u32;
+                            let n = (flags_raw & 8) != 0;
+                            let z = (flags_raw & 4) != 0;
+                            let c = (flags_raw & 2) != 0;
+                            let v = (flags_raw & 1) != 0;
+                            ctx.set_nzcv(n, z, c, v);
+                        }
+                    }
+                }
+            }
+            Op::MRS => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Operand::Reg { reg, .. } = ops[0] {
+                        set_reg_val(reg, ctx.tpidr_el0, ctx);
+                    }
+                }
+            }
+            Op::MSR => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let val = get_operand_val(&ops[1], ctx);
+                    ctx.tpidr_el0 = val;
                 }
             }
             Op::ORR => {
@@ -347,6 +536,9 @@ impl Interpreter {
             }
             Op::SVC => {
                 SyscallDispatcher::handle_syscall(ctx, mem)?;
+                if ctx.exited {
+                    return Ok(false);
+                }
             }
             _ => {
                 return Err(crate::Error::InterpreterError {
@@ -363,5 +555,16 @@ impl Interpreter {
     pub fn run(ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<()> {
         while Interpreter::step(ctx, mem)? {}
         Ok(())
+    }
+
+    pub fn run_max_steps(ctx: &mut CpuContext, mem: &mut MemoryManager, max_steps: usize) -> Result<bool> {
+        let mut steps = 0;
+        while steps < max_steps {
+            if !Interpreter::step(ctx, mem)? {
+                return Ok(true); // Exited cleanly
+            }
+            steps += 1;
+        }
+        Ok(false) // Limit reached
     }
 }
