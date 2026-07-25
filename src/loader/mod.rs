@@ -66,6 +66,18 @@ impl ElfLoader {
             }
         }
 
+        // Process ELF Relocations (R_AARCH64_RELATIVE & R_AARCH64_IRELATIVE)
+        use object::ObjectSection;
+        for section in file.sections() {
+            for (vaddr, reloc) in section.relocations() {
+                let addend = reloc.addend();
+                println!("Reloc at {:#x}: addend={:#x}, flags={:?}", vaddr, addend, reloc.flags());
+                if addend > 0 {
+                    let _ = mem.write(vaddr, &(addend as u64).to_le_bytes());
+                }
+            }
+        }
+
         // Set brk_base after the highest loaded segment
         mem.set_brk_base(max_vaddr);
 

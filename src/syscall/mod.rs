@@ -183,6 +183,49 @@ impl SyscallDispatcher {
                 ctx.set_x(0, res as u64);
                 Ok(res)
             }
+            66 => {
+                // sys_writev(fd, iov, iovcnt)
+                let fd = ctx.get_x(0) as i32;
+                let iov_ptr = ctx.get_x(1);
+                let iovcnt = ctx.get_x(2) as usize;
+
+                let mut total_written = 0i64;
+                for i in 0..iovcnt {
+                    let entry_ptr = iov_ptr + (i * 16) as u64;
+                    let base_bytes = mem.read(entry_ptr, 8)?;
+                    let len_bytes = mem.read(entry_ptr + 8, 8)?;
+                    let base = u64::from_le_bytes(base_bytes.try_into().unwrap());
+                    let len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+
+                    if len > 0 {
+                        let buf = mem.read(base, len)?;
+                        let ret = unsafe {
+                            libc::write(fd, buf.as_ptr() as *const std::ffi::c_void, len)
+                        };
+                        if ret > 0 {
+                            total_written += ret as i64;
+                        }
+                    }
+                }
+                ctx.set_x(0, total_written as u64);
+                Ok(total_written)
+            }
+            134 | 135 => {
+                // sys_rt_sigaction / sys_rt_sigprocmask
+                ctx.set_x(0, 0);
+                Ok(0)
+            }
+            172 | 173 | 174 | 175 | 176 | 177 => {
+                // sys_getpid (172), sys_getppid (173), sys_getuid (174), sys_geteuid (175), sys_getgid (176), sys_getegid (177)
+                let id = 1000i64;
+                ctx.set_x(0, id as u64);
+                Ok(id)
+            }
+            25 | 29 | 80 | 79 | 233 | 261 => {
+                // sys_fcntl(25), sys_ioctl(29), sys_newfstatat(79), sys_fstat(80), sys_madvise(233), sys_prlimit64(261)
+                ctx.set_x(0, 0);
+                Ok(0)
+            }
             _ => Err(crate::Error::UnhandledSyscall(nr)),
         }
     }
