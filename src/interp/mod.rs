@@ -578,6 +578,28 @@ impl Interpreter {
         Self::step(ctx, mem)
     }
 
+    pub fn step_with_jit(
+        ctx: &mut CpuContext,
+        mem: &mut MemoryManager,
+        jit_cache: &mut crate::jit::JitCache,
+    ) -> Result<bool> {
+        if ctx.exited {
+            return Ok(false);
+        }
+
+        let pc = ctx.pc;
+        if !jit_cache.contains(pc) {
+            jit_cache.compile_block(pc, mem)?;
+        }
+
+        if let Some(block) = jit_cache.get_block(pc).cloned() {
+            crate::jit::JitCache::execute_block(&block, ctx, mem)?;
+            return Ok(!ctx.exited);
+        }
+
+        Self::step(ctx, mem)
+    }
+
     pub fn run(ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<()> {
         while Interpreter::step(ctx, mem)? {}
         Ok(())
