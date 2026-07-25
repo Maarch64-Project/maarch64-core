@@ -531,8 +531,8 @@ impl Interpreter {
                     }
                 }
             }
-            Op::NOP => {
-                // Do nothing
+            Op::NOP | Op::BTI | Op::PACIASP | Op::AUTIASP | Op::PACIBSP | Op::AUTIBSP => {
+                // Do nothing (Pointer Authentication & BTI hint instructions)
             }
             Op::SVC => {
                 SyscallDispatcher::handle_syscall(ctx, mem)?;
