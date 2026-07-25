@@ -100,9 +100,20 @@ impl ElfLoader {
         let auxv: &[(u64, u64)] = &[
             (6, 4096),                  // AT_PAGESZ
             (9, entry_point),            // AT_ENTRY
+            (11, 1000),                 // AT_UID
+            (12, 1000),                 // AT_EUID
+            (13, 1000),                 // AT_GID
+            (14, 1000),                 // AT_EGID
+            (23, 0),                    // AT_SECURE
             (25, random_bytes_ptr),      // AT_RANDOM
             (0, 0),                      // AT_NULL
         ];
+
+        // Total 64-bit words to push: argc (1) + argv (len + 1) + envp (1) + auxv (len * 2)
+        let total_words = 1 + arg_ptrs.len() + 1 + 1 + auxv.len() * 2;
+        if total_words % 2 != 0 {
+            sp -= 8; // Alignment padding
+        }
 
         // Push auxv in reverse order
         for &(key, val) in auxv.iter().rev() {
@@ -130,6 +141,9 @@ impl ElfLoader {
         sp -= 8;
         let argc = arg_ptrs.len() as u64;
         mem.write(sp, &argc.to_le_bytes())?;
+
+        // Ensure final SP is 16-byte aligned
+        sp &= !0xf;
 
         Ok(LoadedBinary {
             entry_point,
