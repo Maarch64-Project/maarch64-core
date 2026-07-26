@@ -15,6 +15,7 @@ pub struct JitCache {
     blocks: HashMap<u64, BasicBlock>,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub chained_jumps: u64,
 }
 
 impl JitCache {
@@ -23,6 +24,7 @@ impl JitCache {
             blocks: HashMap::new(),
             cache_hits: 0,
             cache_misses: 0,
+            chained_jumps: 0,
         }
     }
 
@@ -102,5 +104,49 @@ impl JitCache {
             crate::interp::Interpreter::step(ctx, mem)?;
         }
         Ok(())
+    }
+
+    /// Execute basic blocks with direct chaining (block-to-block jumps without returning to top-level dispatcher).
+    pub fn execute_block_chain(
+        &mut self,
+        ctx: &mut CpuContext,
+        mem: &mut MemoryManager,
+        max_chain: usize,
+    ) -> Result<bool> {
+        let mut chain_count = 0;
+
+        while chain_count < max_chain {
+            if ctx.exited {
+                return Ok(false);
+            }
+
+            let pc = ctx.pc;
+            if !self.blocks.contains_key(&pc) {
+                if self.compile_block(pc, mem).is_err() {
+                    break;
+                }
+                self.cache_misses += 1;
+            } else {
+                self.cache_hits += 1;
+            }
+
+            let block = match self.blocks.get(&pc) {
+                Some(b) => b.clone(),
+                None => break,
+            };
+
+            Self::execute_block(&block, ctx, mem)?;
+
+            chain_count += 1;
+            if chain_count > 1 {
+                self.chained_jumps += 1;
+            }
+
+            if ctx.exited || ctx.pc == pc {
+                break;
+            }
+        }
+
+        Ok(!ctx.exited)
     }
 }

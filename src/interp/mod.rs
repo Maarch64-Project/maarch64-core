@@ -2687,21 +2687,20 @@ impl Interpreter {
         mem: &mut MemoryManager,
         jit_cache: &mut crate::jit::JitCache,
     ) -> Result<bool> {
-        if ctx.exited {
-            return Ok(false);
-        }
+        jit_cache.execute_block_chain(ctx, mem, 1)
+    }
 
-        let pc = ctx.pc;
-        if !jit_cache.contains(pc) {
-            jit_cache.compile_block(pc, mem)?;
+    pub fn run_with_jit(
+        ctx: &mut CpuContext,
+        mem: &mut MemoryManager,
+        jit_cache: &mut crate::jit::JitCache,
+    ) -> Result<()> {
+        while !ctx.exited {
+            if !jit_cache.execute_block_chain(ctx, mem, 1000)? {
+                break;
+            }
         }
-
-        if let Some(block) = jit_cache.get_block(pc).cloned() {
-            crate::jit::JitCache::execute_block(&block, ctx, mem)?;
-            return Ok(!ctx.exited);
-        }
-
-        Self::step(ctx, mem)
+        Ok(())
     }
 
     pub fn run(ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<()> {
