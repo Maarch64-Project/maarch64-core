@@ -947,6 +947,18 @@ impl Interpreter {
                     }
                 }
             }
+            Op::STLXRB | Op::STXRB => {
+                let ops = inst.operands();
+                if ops.len() >= 3 {
+                    if let Operand::Reg { reg: status_reg, .. } = ops[0] {
+                        let val = get_operand_val(&ops[1], ctx) as u8;
+                        if let Some(addr) = eval_mem_addr(&ops[2], ctx) {
+                            mem.write(addr, &[val]).map_err(|e| m_err(pc, e))?;
+                            set_reg_val(status_reg, 0, ctx);
+                        }
+                    }
+                }
+            }
             Op::STRH | Op::STURH => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
@@ -1012,7 +1024,7 @@ impl Interpreter {
                     }
                 }
             }
-            Op::LDRB | Op::LDURB => {
+            Op::LDRB | Op::LDURB | Op::LDXRB | Op::LDAXRB | Op::LDARB => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     if let Some(reg) = get_op_reg(&ops[0]) {
@@ -1039,7 +1051,7 @@ impl Interpreter {
                     }
                 }
             }
-            Op::STRB | Op::STURB => {
+            Op::STRB | Op::STURB | Op::STLRB => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     let val = get_operand_val(&ops[0], ctx) as u8;
@@ -1868,7 +1880,7 @@ impl Interpreter {
                     }
                 }
             }
-            Op::ADDV | Op::UMAXV | Op::UMINV | Op::SMAXV | Op::SMINV => {
+            Op::ADDV | Op::UADDLV | Op::SADDLV | Op::UMAXV | Op::UMINV | Op::SMAXV | Op::SMINV => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     let r1 = get_op_reg(&ops[0]);
@@ -1883,9 +1895,13 @@ impl Interpreter {
                             1 => {
                                 let count = if is_64 { 8 } else { 16 };
                                 match inst.op() {
-                                    Op::ADDV => {
+                                    Op::ADDV | Op::UADDLV => {
                                         let sum: u64 = ctx.v[idx2][..count].iter().map(|&b| b as u64).sum();
                                         res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::SADDLV => {
+                                        let sum: i64 = ctx.v[idx2][..count].iter().map(|&b| b as i8 as i64).sum();
+                                        res[..8].copy_from_slice(&(sum as u64).to_le_bytes());
                                     }
                                     Op::UMAXV => {
                                         res[0] = ctx.v[idx2][..count].iter().copied().max().unwrap_or(0);
@@ -1907,9 +1923,13 @@ impl Interpreter {
                                 let slice = &ctx.v[idx2];
                                 let elems: Vec<u16> = (0..count).map(|i| u16::from_le_bytes([slice[i*2], slice[i*2+1]])).collect();
                                 match inst.op() {
-                                    Op::ADDV => {
+                                    Op::ADDV | Op::UADDLV => {
                                         let sum: u64 = elems.iter().map(|&h| h as u64).sum();
                                         res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::SADDLV => {
+                                        let sum: i64 = elems.iter().map(|&h| h as i16 as i64).sum();
+                                        res[..8].copy_from_slice(&(sum as u64).to_le_bytes());
                                     }
                                     Op::UMAXV => {
                                         let m = elems.iter().copied().max().unwrap_or(0);
@@ -1935,9 +1955,13 @@ impl Interpreter {
                                 let slice = &ctx.v[idx2];
                                 let elems: Vec<u32> = (0..count).map(|i| u32::from_le_bytes(slice[i*4..i*4+4].try_into().unwrap())).collect();
                                 match inst.op() {
-                                    Op::ADDV => {
+                                    Op::ADDV | Op::UADDLV => {
                                         let sum: u64 = elems.iter().map(|&w| w as u64).sum();
                                         res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::SADDLV => {
+                                        let sum: i64 = elems.iter().map(|&w| w as i32 as i64).sum();
+                                        res[..8].copy_from_slice(&(sum as u64).to_le_bytes());
                                     }
                                     Op::UMAXV => {
                                         let m = elems.iter().copied().max().unwrap_or(0);
