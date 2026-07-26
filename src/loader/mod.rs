@@ -86,6 +86,11 @@ impl ElfLoader {
         // Process ELF Dynamic Relocations (R_AARCH64_RELATIVE & dynamic symbols) for PIE binaries
         if load_bias > 0 {
             let dyn_syms: Vec<_> = file.dynamic_symbols().collect();
+            for (idx, ds) in dyn_syms.iter().enumerate() {
+                if let Ok(name) = ds.name() {
+                    tracing::info!("[dyn_sym] idx={} name={:?} is_undef={}", idx, name, ds.is_undefined());
+                }
+            }
 
             if let Some(relocs) = file.dynamic_relocations() {
                 let mut reloc_count = 0;
@@ -121,6 +126,7 @@ impl ElfLoader {
                                             dynamic_thunks.push((a, name.to_string()));
                                             a
                                         });
+                                        tracing::info!("[reloc] target_addr={:#x} sym_idx={} name={} tramp_addr={:#x}", target_addr, sym_idx.0, name, tramp_addr);
                                         let _ = mem.write(target_addr, &tramp_addr.to_le_bytes());
                                         continue;
                                     }
@@ -142,20 +148,8 @@ impl ElfLoader {
                 }
                 tracing::info!("[+] Processed {} dynamic RELATIVE relocations, {} symbol thunks", reloc_count, symbol_map.len());
             }
-        } else {
-            // Overwrite GOT table for IRELATIVE resolvers to point to actual SIMD implementations in static binaries
-            let got_fixes: &[(u64, u64)] = &[
-                (0x610000, 0x401a40), // memmove/memcpy
-                (0x610008, 0x401fc0), // memset
-                (0x610010, 0x402b40), // strcpy
-                (0x610018, 0x401a40), // memcpy
-                (0x610020, 0x402b40), // stpcpy
-            ];
-            for &(vaddr, val) in got_fixes {
-                let _ = mem.write(vaddr, &val.to_le_bytes());
-            }
-            tracing::info!("[+] Fixed {} IRELATIVE GOT entries", got_fixes.len());
         }
+
 
         // Set brk_base after the highest loaded segment
         mem.set_brk_base(max_vaddr);
@@ -229,7 +223,7 @@ impl ElfLoader {
             (13, 0),                     // AT_GID
             (14, 0),                     // AT_EGID
             (15, platform_ptr),          // AT_PLATFORM ("aarch64")
-            (16, 0xff),                  // AT_HWCAP (fp, asimd, evtstrm, aes, pmull, sha1, sha2, crc32)
+            (16, 0),                     // AT_HWCAP (0 = scalar software fallback)
             (17, 100),                   // AT_CLKTCK
             (23, 0),                     // AT_SECURE
             (25, random_bytes_ptr),      // AT_RANDOM

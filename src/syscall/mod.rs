@@ -1,6 +1,6 @@
 use crate::{cpu::CpuContext, memory::MemoryManager, Result};
 
-fn translate_open_flags(aarch64_flags: i32) -> i32 {
+pub fn translate_open_flags(aarch64_flags: i32) -> i32 {
     let mut host_flags = 0;
     let common_mask = libc::O_ACCMODE | libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY | libc::O_TRUNC | libc::O_APPEND | libc::O_NONBLOCK | libc::O_CLOEXEC;
     host_flags |= aarch64_flags & common_mask;
@@ -17,7 +17,7 @@ fn translate_open_flags(aarch64_flags: i32) -> i32 {
     if aarch64_flags & 0x40000 != 0 {
         host_flags |= libc::O_NOATIME;
     }
-    if aarch64_flags & 0x200000 != 0 {
+    if aarch64_flags & 0x400000 != 0 {
         host_flags |= libc::O_PATH;
     }
     host_flags
@@ -129,7 +129,16 @@ impl SyscallDispatcher {
                 let res = unsafe {
                     libc::openat(dfd, actual_path.as_ptr(), host_flags, mode)
                 };
-                let ret = res as i64;
+                if res >= 0 {
+                    let cur_off = unsafe { libc::lseek(res, 0, libc::SEEK_CUR) };
+                    tracing::info!("[sys_openat] opened fd={}, initial_offset={}", res, cur_off);
+                }
+                let ret = if res < 0 {
+                    let err = unsafe { *libc::__errno_location() };
+                    -err as i64
+                } else {
+                    res as i64
+                };
                 ctx.set_x(0, ret as u64);
                 Ok(ret)
             }
@@ -199,6 +208,7 @@ impl SyscallDispatcher {
                 // sys_exit / sys_exit_group(status)
                 let status = ctx.get_x(0) as i32;
                 tracing::debug!("[sys_exit] status = {}, pc = {:#x}", status, ctx.pc);
+                unsafe { libc::fflush(std::ptr::null_mut()); }
                 ctx.exited = true;
                 ctx.exit_code = status;
                 Ok(status as i64)
@@ -518,14 +528,20 @@ impl SyscallDispatcher {
                 // sys_newfstatat(79), sys_fstat(80)
                 let statbuf = if nr == 79 { ctx.get_x(2) } else { ctx.get_x(1) };
                 if statbuf != 0 {
-                    let path = if nr == 79 {
-                        mem.read_string(ctx.get_x(1)).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default()
+                    let meta_res = if nr == 80 {
+                        let fd = ctx.get_x(0) as i32;
+                        use std::os::unix::io::FromRawFd;
+                        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                        let res = file.metadata();
+                        let _ = std::mem::forget(file);
+                        res
                     } else {
-                        "".to_string()
+                        let path = mem.read_string(ctx.get_x(1)).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
+                        let target_path = if path.is_empty() { ".".to_string() } else { path };
+                        std::fs::metadata(&target_path)
                     };
-                    let target_path = if path.is_empty() { ".".to_string() } else { path };
-                    tracing::info!("[newfstatat] path={:?} target_path={:?}", mem.read_string(ctx.get_x(1)).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default(), target_path);
-                    if let Ok(meta) = std::fs::metadata(&target_path) {
+                    if let Ok(meta) = meta_res {
+                        tracing::info!("[sys_fstat/newfstatat] nr={} size={} mode={:#o} statbuf={:#x}", nr, meta.size(), meta.mode(), statbuf);
                         use std::os::unix::fs::MetadataExt;
                         let mut buf = [0u8; 128];
                         buf[0..8].copy_from_slice(&meta.dev().to_le_bytes());
@@ -609,6 +625,7 @@ impl SyscallDispatcher {
                 let whence = ctx.get_x(2) as i32;
 
                 let ret = unsafe { libc::lseek(fd, offset, whence) };
+                tracing::info!("[sys_lseek] fd={}, offset={}, whence={} -> ret={}", fd, offset, whence, ret);
                 if ret < 0 {
                     let err = unsafe { *libc::__errno_location() };
                     let neg_err = -err as i64;
