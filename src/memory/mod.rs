@@ -34,6 +34,8 @@ pub struct MemoryManager {
     segments: Vec<MemorySegment>,
     pub brk_base: u64,
     pub brk_current: u64,
+    pub brk_mapped_end: u64,
+    pub mmap_current: u64,
 }
 
 impl MemoryManager {
@@ -42,6 +44,8 @@ impl MemoryManager {
             segments: Vec::new(),
             brk_base: 0,
             brk_current: 0,
+            brk_mapped_end: 0,
+            mmap_current: 0x7000_0000_0000,
         }
     }
 
@@ -49,6 +53,7 @@ impl MemoryManager {
         let aligned_base = align_up_page(base);
         self.brk_base = aligned_base;
         self.brk_current = aligned_base;
+        self.brk_mapped_end = aligned_base;
     }
 
     pub fn set_brk(&mut self, new_brk: u64) -> Result<u64> {
@@ -56,17 +61,18 @@ impl MemoryManager {
             return Ok(self.brk_current);
         }
 
-        if new_brk > self.brk_current {
-            let cur_aligned = align_up_page(self.brk_current);
-            let new_aligned = align_up_page(new_brk);
-            let expand_size = (new_aligned - cur_aligned) as usize;
+        if new_brk > self.brk_mapped_end {
+            let cur_mapped = self.brk_mapped_end;
+            let new_mapped = align_up_page(new_brk);
+            let expand_size = (new_mapped - cur_mapped) as usize;
 
             if expand_size > 0 {
                 let mapped = self.map_anonymous_prot(
-                    cur_aligned,
+                    cur_mapped,
                     expand_size,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 )?;
+                self.brk_mapped_end = new_mapped;
                 tracing::info!("Expanded heap brk from {:#x} to {:#x} (mapped {:#x})", self.brk_current, new_brk, mapped);
             }
         }
@@ -149,33 +155,70 @@ impl MemoryManager {
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
-        for seg in &mut self.segments {
-            if addr >= seg.addr && addr + (data.len() as u64) <= seg.addr + (seg.size as u64) {
-                let offset = (addr - seg.addr) as usize;
-                let slice = seg.as_mut_slice();
-                slice[offset..offset + data.len()].copy_from_slice(data);
-                return Ok(());
+        let mut bytes_written = 0;
+        while bytes_written < data.len() {
+            let cur_addr = addr + bytes_written as u64;
+            let remaining = data.len() - bytes_written;
+            let mut chunk_written = 0;
+            for seg in &mut self.segments {
+                if cur_addr >= seg.addr && cur_addr < seg.addr + (seg.size as u64) {
+                    let offset = (cur_addr - seg.addr) as usize;
+                    let avail = seg.size - offset;
+                    let to_write = remaining.min(avail);
+                    let slice = seg.as_mut_slice();
+                    slice[offset..offset + to_write].copy_from_slice(&data[bytes_written..bytes_written + to_write]);
+                    chunk_written = to_write;
+                    break;
+                }
             }
+            if chunk_written == 0 {
+                let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
+                return Err(crate::Error::MemoryError(format!(
+                    "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
+                    addr, data.len(), seg_info
+                )));
+            }
+            bytes_written += chunk_written;
         }
-        let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
-        Err(crate::Error::MemoryError(format!(
-            "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
-            addr, data.len(), seg_info
-        )))
+        Ok(())
     }
 
-    pub fn read(&self, addr: u64, len: usize) -> Result<&[u8]> {
+    pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         for seg in &self.segments {
             if addr >= seg.addr && addr + (len as u64) <= seg.addr + (seg.size as u64) {
                 let offset = (addr - seg.addr) as usize;
-                return Ok(&seg.as_slice()[offset..offset + len]);
+                return Ok(seg.as_slice()[offset..offset + len].to_vec());
             }
         }
-        let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
-        Err(crate::Error::MemoryError(format!(
-            "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
-            addr, len, seg_info
-        )))
+        let mut buf = vec![0u8; len];
+        let mut bytes_read = 0;
+        while bytes_read < len {
+            let cur_addr = addr + bytes_read as u64;
+            let remaining = len - bytes_read;
+            let mut chunk_read = 0;
+            for seg in &self.segments {
+                if cur_addr >= seg.addr && cur_addr < seg.addr + (seg.size as u64) {
+                    let offset = (cur_addr - seg.addr) as usize;
+                    let avail = seg.size - offset;
+                    let to_read = remaining.min(avail);
+                    buf[bytes_read..bytes_read + to_read].copy_from_slice(&seg.as_slice()[offset..offset + to_read]);
+                    chunk_read = to_read;
+                    break;
+                }
+            }
+            if chunk_read == 0 {
+                let seg_info = self.segments.iter().map(|s| format!("[{:#x}..{:#x}]", s.addr, s.addr + s.size as u64)).collect::<Vec<_>>().join(", ");
+                return Err(crate::Error::MemoryError(format!(
+                    "Address {:#x} (len {}) out of mapped bounds. Segments: {}",
+                    addr, len, seg_info
+                )));
+            }
+            bytes_read += chunk_read;
+        }
+        Ok(buf)
     }
 
     pub fn get_host_ptr(&self, addr: u64) -> Result<*const u8> {
