@@ -1,11 +1,12 @@
 use crate::{memory::MemoryManager, Result};
-use object::{Object, ObjectSegment};
+use object::{Object, ObjectSegment, ObjectSymbol};
 use std::path::Path;
 
 #[derive(Debug)]
 pub struct LoadedBinary {
     pub entry_point: u64,
     pub stack_pointer: u64,
+    pub dynamic_thunks: Vec<(u64, String)>,
 }
 
 pub struct ElfLoader;
@@ -30,13 +31,16 @@ impl ElfLoader {
         let file = object::File::parse(&*data)
             .map_err(|e| crate::Error::LoadError(format!("ELF parse error: {}", e)))?;
 
-        let entry_point = file.entry();
-        tracing::info!("ELF Entry point: {:#x}", entry_point);
+        let is_pie = file.segments().next().map(|s| s.address()).unwrap_or(0) == 0;
+        let load_bias: u64 = if is_pie { 0x400000 } else { 0 };
+
+        let entry_point = file.entry() + load_bias;
+        tracing::info!("ELF Entry point: {:#x} (load_bias: {:#x})", entry_point, load_bias);
 
         let mut max_vaddr: u64 = 0;
 
         for segment in file.segments() {
-            let vaddr = segment.address();
+            let vaddr = segment.address() + load_bias;
             let size = segment.size() as usize;
             if size == 0 {
                 continue;
@@ -71,19 +75,87 @@ impl ElfLoader {
             }
         }
 
-        // Process ELF Dynamic Relocations (R_AARCH64_RELATIVE & R_AARCH64_IRELATIVE)
-        // Overwrite GOT table for IRELATIVE resolvers to point to actual SIMD implementations
-        let got_fixes: &[(u64, u64)] = &[
-            (0x610000, 0x401a40), // memmove/memcpy
-            (0x610008, 0x401fc0), // memset
-            (0x610010, 0x402b40), // strcpy
-            (0x610018, 0x401a40), // memcpy
-            (0x610020, 0x402b40), // stpcpy
-        ];
-        for &(vaddr, val) in got_fixes {
-            let _ = mem.write(vaddr, &val.to_le_bytes());
+        let mut dynamic_thunks = Vec::new();
+
+        // Map 128KB Thunk Trampoline & Data Symbol page at 0x7f000000
+        let _ = mem.map_anonymous(0x7f000000, 0x20000);
+        // Initialize default values for data symbols
+        let _ = mem.write(0x7f010300, &1u32.to_le_bytes()); // optind = 1
+        let _ = mem.write(0x7f010310, &1u32.to_le_bytes()); // opterr = 1
+
+        // Process ELF Dynamic Relocations (R_AARCH64_RELATIVE & dynamic symbols) for PIE binaries
+        if load_bias > 0 {
+            let dyn_syms: Vec<_> = file.dynamic_symbols().collect();
+
+            if let Some(relocs) = file.dynamic_relocations() {
+                let mut reloc_count = 0;
+                let mut symbol_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+                for (addr, reloc) in relocs {
+                    let target_addr = addr + load_bias;
+                    let target = reloc.target();
+                    if let object::RelocationTarget::Symbol(sym_idx) = target {
+                        if let Some(sym) = sym_idx.0.checked_sub(1).and_then(|i| dyn_syms.get(i)) {
+                            if sym.is_undefined() {
+                                if let Ok(name) = sym.name() {
+                                    if !name.is_empty() {
+                                        let data_sym_val: u64 = match name {
+                                            "stdout" => 0x7f010000,
+                                            "stderr" => 0x7f010100,
+                                            "stdin" => 0x7f010200,
+                                            "optind" => 0x7f010300,
+                                            "optarg" => 0x7f010308,
+                                            "opterr" => 0x7f010310,
+                                            "optopt" => 0x7f010318,
+                                            "environ" => 0x7f010400,
+                                            _ => 0,
+                                        };
+                                        if data_sym_val != 0 {
+                                            let _ = mem.write(target_addr, &data_sym_val.to_le_bytes());
+                                            continue;
+                                        }
+
+                                        let next_idx = symbol_map.len() as u64;
+                                        let tramp_addr = *symbol_map.entry(name.to_string()).or_insert_with(|| {
+                                            let a = 0x7f000000 + next_idx * 8;
+                                            dynamic_thunks.push((a, name.to_string()));
+                                            a
+                                        });
+                                        let _ = mem.write(target_addr, &tramp_addr.to_le_bytes());
+                                        continue;
+                                    }
+                                }
+                            } else if sym.address() != 0 {
+                                let addend = reloc.addend() as u64;
+                                let val = sym.address() + load_bias + addend;
+                                let _ = mem.write(target_addr, &val.to_le_bytes());
+                                reloc_count += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let addend = reloc.addend() as u64;
+                    let val = load_bias.wrapping_add(addend);
+                    let _ = mem.write(target_addr, &val.to_le_bytes());
+                    reloc_count += 1;
+                }
+                tracing::info!("[+] Processed {} dynamic RELATIVE relocations, {} symbol thunks", reloc_count, symbol_map.len());
+            }
+        } else {
+            // Overwrite GOT table for IRELATIVE resolvers to point to actual SIMD implementations in static binaries
+            let got_fixes: &[(u64, u64)] = &[
+                (0x610000, 0x401a40), // memmove/memcpy
+                (0x610008, 0x401fc0), // memset
+                (0x610010, 0x402b40), // strcpy
+                (0x610018, 0x401a40), // memcpy
+                (0x610020, 0x402b40), // stpcpy
+            ];
+            for &(vaddr, val) in got_fixes {
+                let _ = mem.write(vaddr, &val.to_le_bytes());
+            }
+            tracing::info!("[+] Fixed {} IRELATIVE GOT entries", got_fixes.len());
         }
-        tracing::info!("[+] Fixed {} IRELATIVE GOT entries", got_fixes.len());
 
         // Set brk_base after the highest loaded segment
         mem.set_brk_base(max_vaddr);
@@ -152,10 +224,10 @@ impl ElfLoader {
             (7, 0),                      // AT_BASE
             (8, 0),                      // AT_FLAGS
             (9, entry_point),            // AT_ENTRY
-            (11, 1000),                  // AT_UID
-            (12, 1000),                  // AT_EUID
-            (13, 1000),                  // AT_GID
-            (14, 1000),                  // AT_EGID
+            (11, 0),                     // AT_UID
+            (12, 0),                     // AT_EUID
+            (13, 0),                     // AT_GID
+            (14, 0),                     // AT_EGID
             (15, platform_ptr),          // AT_PLATFORM ("aarch64")
             (16, 0xff),                  // AT_HWCAP (fp, asimd, evtstrm, aes, pmull, sha1, sha2, crc32)
             (17, 100),                   // AT_CLKTCK
@@ -215,6 +287,7 @@ impl ElfLoader {
         Ok(LoadedBinary {
             entry_point,
             stack_pointer: sp,
+            dynamic_thunks,
         })
     }
 }

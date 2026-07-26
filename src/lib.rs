@@ -5,6 +5,7 @@ pub mod jit;
 pub mod loader;
 pub mod memory;
 pub mod syscall;
+pub mod vfs;
 
 pub use cpu::CpuContext;
 pub use loader::ElfLoader;

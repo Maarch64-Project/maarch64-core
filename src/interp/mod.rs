@@ -94,6 +94,21 @@ fn is_64bit_vector(op: &Operand) -> bool {
     s.contains("8B") || s.contains("4H") || s.contains("2S") || s.contains("1D") || s.contains("8b") || s.contains("4h") || s.contains("2s") || s.contains("1d")
 }
 
+fn get_vec_elem_size(op: &Operand) -> usize {
+    let s = format!("{:?}", op);
+    if s.contains("16B") || s.contains("8B") || s.contains("16b") || s.contains("8b") {
+        1
+    } else if s.contains("8H") || s.contains("4H") || s.contains("8h") || s.contains("4h") {
+        2
+    } else if s.contains("4S") || s.contains("2S") || s.contains("4s") || s.contains("2s") {
+        4
+    } else if s.contains("2D") || s.contains("1D") || s.contains("2d") || s.contains("1d") {
+        8
+    } else {
+        1
+    }
+}
+
 fn v_reg_idx(reg: Reg) -> Option<usize> {
     match reg {
         Reg::B0 | Reg::H0 | Reg::S0 | Reg::D0 | Reg::Q0 | Reg::V0 => Some(0),
@@ -238,13 +253,27 @@ fn get_multi_regs(op: &Operand) -> Vec<Reg> {
     }
 }
 
+fn eval_imm_shift(raw_val: u64, shift: Option<&bad64::Shift>) -> u64 {
+    if let Some(s) = shift {
+        match s {
+            bad64::Shift::LSL(amt) => raw_val.wrapping_shl(*amt as u32),
+            bad64::Shift::LSR(amt) => raw_val.wrapping_shr(*amt as u32),
+            bad64::Shift::ASR(amt) => ((raw_val as i64).wrapping_shr(*amt as u32)) as u64,
+            bad64::Shift::ROR(amt) => raw_val.rotate_right(*amt as u32),
+            _ => raw_val,
+        }
+    } else {
+        raw_val
+    }
+}
+
 fn get_operand_val(op: &Operand, ctx: &CpuContext) -> u64 {
     match op {
         Operand::Reg { reg, .. } => get_reg_val(*reg, ctx),
         Operand::QualReg { reg, .. } => get_reg_val(*reg, ctx),
         Operand::ShiftReg { reg, shift, .. } => eval_shift_reg(*reg, shift, ctx),
-        Operand::Imm64 { imm, .. } => imm_to_u64(imm),
-        Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+        Operand::Imm64 { imm, shift } => eval_imm_shift(imm_to_u64(imm), shift.as_ref()),
+        Operand::Imm32 { imm, shift } => eval_imm_shift(imm_to_u64(imm), shift.as_ref()),
         Operand::Label(imm) => imm_to_u64(imm),
         _ => 0,
     }
@@ -307,7 +336,7 @@ fn eval_mem_addr(op: &Operand, ctx: &mut CpuContext) -> Option<u64> {
             let off = if let Some(s) = shift {
                 eval_shift_reg(regs[1], s, ctx)
             } else if is_w_reg(regs[1]) {
-                (get_reg_val(regs[1], ctx) as i32) as i64 as u64
+                (get_reg_val(regs[1], ctx) as u32) as u64
             } else {
                 get_reg_val(regs[1], ctx)
             };
@@ -340,6 +369,8 @@ impl Interpreter {
         let pc = ctx.pc;
         let ins_bytes = mem.read(pc, 4).map_err(|e| m_err(pc, e))?;
         let ins_u32 = u32::from_le_bytes(ins_bytes.try_into().unwrap());
+
+
 
         // Handle DC ZVA (0xd50b7400 | Rt)
         if (ins_u32 & 0xfffffe00) == 0xd50b7400 {
@@ -492,14 +523,13 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let imm = get_operand_val(&ops[1], ctx) & 0xffff;
-                        let s_val = if let Operand::Imm64 { shift, .. } = ops[1] {
-                            shift_val(shift.as_ref())
-                        } else if let Operand::Imm32 { shift, .. } = ops[1] {
-                            shift_val(shift.as_ref())
-                        } else {
-                            0
+                        let (raw_imm, shift_opt) = match &ops[1] {
+                            Operand::Imm64 { imm, shift } => (imm_to_u64(imm), shift.as_ref()),
+                            Operand::Imm32 { imm, shift } => (imm_to_u64(imm), shift.as_ref()),
+                            _ => (get_operand_val(&ops[1], ctx), None),
                         };
+                        let imm = raw_imm & 0xffff;
+                        let s_val = shift_val(shift_opt);
                         let cur_val = get_reg_val(reg, ctx);
                         let mask = !(0xffffu64 << s_val);
                         let new_val = (cur_val & mask) | (imm << s_val);
@@ -545,8 +575,9 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 3 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
+                        let is_32 = is_w_reg(reg);
+                        let v1 = if is_32 { (get_operand_val(&ops[1], ctx) as u32) as u64 } else { get_operand_val(&ops[1], ctx) };
+                        let v2 = if is_32 { (get_operand_val(&ops[2], ctx) as u32) as u64 } else { get_operand_val(&ops[2], ctx) };
                         let res = if v2 == 0 { 0 } else { v1 / v2 };
                         set_reg_val(reg, res, ctx);
                     }
@@ -556,9 +587,16 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 3 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx) as i64;
-                        let v2 = get_operand_val(&ops[2], ctx) as i64;
-                        let res = if v2 == 0 { 0 } else { (v1 / v2) as u64 };
+                        let is_32 = is_w_reg(reg);
+                        let res = if is_32 {
+                            let v1 = get_operand_val(&ops[1], ctx) as i32;
+                            let v2 = get_operand_val(&ops[2], ctx) as i32;
+                            if v2 == 0 { 0 } else { (v1 / v2) as u32 as u64 }
+                        } else {
+                            let v1 = get_operand_val(&ops[1], ctx) as i64;
+                            let v2 = get_operand_val(&ops[2], ctx) as i64;
+                            if v2 == 0 { 0 } else { (v1 / v2) as u64 }
+                        };
                         set_reg_val(reg, res, ctx);
                     }
                 }
@@ -601,9 +639,10 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 4 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
-                        let v3 = get_operand_val(&ops[3], ctx);
+                        let is_32 = is_w_reg(reg);
+                        let v1 = if is_32 { (get_operand_val(&ops[1], ctx) as u32) as u64 } else { get_operand_val(&ops[1], ctx) };
+                        let v2 = if is_32 { (get_operand_val(&ops[2], ctx) as u32) as u64 } else { get_operand_val(&ops[2], ctx) };
+                        let v3 = if is_32 { (get_operand_val(&ops[3], ctx) as u32) as u64 } else { get_operand_val(&ops[3], ctx) };
                         set_reg_val(reg, v3.wrapping_add(v1.wrapping_mul(v2)), ctx);
                     }
                 }
@@ -612,9 +651,10 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 4 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
-                        let v3 = get_operand_val(&ops[3], ctx);
+                        let is_32 = is_w_reg(reg);
+                        let v1 = if is_32 { (get_operand_val(&ops[1], ctx) as u32) as u64 } else { get_operand_val(&ops[1], ctx) };
+                        let v2 = if is_32 { (get_operand_val(&ops[2], ctx) as u32) as u64 } else { get_operand_val(&ops[2], ctx) };
+                        let v3 = if is_32 { (get_operand_val(&ops[3], ctx) as u32) as u64 } else { get_operand_val(&ops[3], ctx) };
                         set_reg_val(reg, v3.wrapping_sub(v1.wrapping_mul(v2)), ctx);
                     }
                 }
@@ -623,8 +663,9 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 3 {
                     if let Operand::Reg { reg, .. } = ops[0] {
-                        let v1 = get_operand_val(&ops[1], ctx);
-                        let v2 = get_operand_val(&ops[2], ctx);
+                        let is_32 = is_w_reg(reg);
+                        let v1 = if is_32 { (get_operand_val(&ops[1], ctx) as u32) as u64 } else { get_operand_val(&ops[1], ctx) };
+                        let v2 = if is_32 { (get_operand_val(&ops[2], ctx) as u32) as u64 } else { get_operand_val(&ops[2], ctx) };
                         set_reg_val(reg, (0u64).wrapping_sub(v1.wrapping_mul(v2)), ctx);
                     }
                 }
@@ -1244,23 +1285,27 @@ impl Interpreter {
                     let val = get_operand_val(&ops[1], ctx);
                     if let Some(rd) = get_op_reg(&ops[0]) {
                         if let Some(idx) = v_reg_idx(rd) {
+                            let elem_sz = get_vec_elem_size(&ops[0]);
                             ctx.v[idx] = [0u8; 16];
-                            if let Some(rn) = get_op_reg(&ops[1]) {
-                                if is_w_reg(rn) {
-                                    let bytes = (val as u32).to_le_bytes();
+                            match elem_sz {
+                                1 => ctx.v[idx].fill((val & 0xff) as u8),
+                                2 => {
+                                    let bytes = ((val & 0xffff) as u16).to_le_bytes();
+                                    for i in 0..8 {
+                                        ctx.v[idx][i * 2..i * 2 + 2].copy_from_slice(&bytes);
+                                    }
+                                }
+                                4 => {
+                                    let bytes = ((val & 0xffffffff) as u32).to_le_bytes();
                                     for i in 0..4 {
                                         ctx.v[idx][i * 4..i * 4 + 4].copy_from_slice(&bytes);
                                     }
-                                } else {
+                                }
+                                _ => {
                                     let bytes = val.to_le_bytes();
                                     for i in 0..2 {
                                         ctx.v[idx][i * 8..i * 8 + 8].copy_from_slice(&bytes);
                                     }
-                                }
-                            } else {
-                                let bytes = (val as u32).to_le_bytes();
-                                for i in 0..4 {
-                                    ctx.v[idx][i * 4..i * 4 + 4].copy_from_slice(&bytes);
                                 }
                             }
                         } else {
@@ -1304,9 +1349,12 @@ impl Interpreter {
                     if let Some(mut addr) = eval_mem_addr(&ops[1], ctx) {
                         for reg in regs {
                             if inst.op() == Op::LD1R {
-                                let val_bytes = mem.read(addr, 1).map_err(|e| m_err(pc, e))?;
+                                let elem_sz = get_vec_elem_size(&ops[0]);
+                                let val_bytes = mem.read(addr, elem_sz).map_err(|e| m_err(pc, e))?;
                                 if let Some(idx) = v_reg_idx(reg) {
-                                    ctx.v[idx].fill(val_bytes[0]);
+                                    for chunk in ctx.v[idx].chunks_exact_mut(elem_sz) {
+                                        chunk.copy_from_slice(&val_bytes);
+                                    }
                                 }
                             } else {
                                 let sz = if is_64bit_vector(&ops[0]) { 8 } else { 16 };
@@ -1317,6 +1365,34 @@ impl Interpreter {
                                 }
                                 addr += sz as u64;
                             }
+                        }
+                        if ops.len() >= 3 {
+                            let post_off = match &ops[2] {
+                                Operand::Imm32 { imm, .. } => imm_to_i64(imm),
+                                Operand::Imm64 { imm, .. } => imm_to_i64(imm),
+                                op => get_op_reg(op).map(|r| get_reg_val(r, ctx) as i64).unwrap_or(0),
+                            };
+                            if post_off != 0 {
+                                if let Operand::MemOffset { reg: base_reg, .. } = ops[1] {
+                                    let cur = get_reg_val(base_reg, ctx);
+                                    set_reg_val(base_reg, (cur as i64 + post_off) as u64, ctx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Op::ST1 => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    let regs = get_multi_regs(&ops[0]);
+                    if let Some(mut addr) = eval_mem_addr(&ops[1], ctx) {
+                        for reg in regs {
+                            let sz = if is_64bit_vector(&ops[0]) { 8 } else { 16 };
+                            if let Some(idx) = v_reg_idx(reg) {
+                                mem.write(addr, &ctx.v[idx][..sz]).map_err(|e| m_err(pc, e))?;
+                            }
+                            addr += sz as u64;
                         }
                         if ops.len() >= 3 {
                             let post_off = match &ops[2] {
@@ -1458,19 +1534,69 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
                     let vec1 = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or([0u8; 16]);
-                    let vec2 = ops.get(2).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or(vec1);
-                    let v1_lo = u64::from_le_bytes(vec1[..8].try_into().unwrap());
-                    let v1_hi = u64::from_le_bytes(vec1[8..16].try_into().unwrap());
-                    let v2_lo = u64::from_le_bytes(vec2[..8].try_into().unwrap());
-                    let v2_hi = u64::from_le_bytes(vec2[8..16].try_into().unwrap());
+                    let vec2 = if ops.len() >= 3 {
+                        ops.get(2).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or(vec1)
+                    } else { vec1 };
+                    let elem_sz = get_vec_elem_size(&ops[0]);
+                    let is_64 = is_64bit_vector(&ops[0]);
                     let mut res = [0u8; 16];
-                    res[..8].copy_from_slice(&v1_lo.wrapping_add(v1_hi).to_le_bytes());
-                    res[8..16].copy_from_slice(&v2_lo.wrapping_add(v2_hi).to_le_bytes());
+                    match elem_sz {
+                        1 => {
+                            let count = if is_64 { 4 } else { 8 };
+                            for i in 0..count {
+                                res[i] = vec1[i * 2].wrapping_add(vec1[i * 2 + 1]);
+                            }
+                            if !is_64 {
+                                for i in 0..4 {
+                                    res[4 + i] = vec2[i * 2].wrapping_add(vec2[i * 2 + 1]);
+                                }
+                            }
+                        }
+                        2 => {
+                            let count = if is_64 { 2 } else { 4 };
+                            for i in 0..count {
+                                let a = u16::from_le_bytes([vec1[i * 4], vec1[i * 4 + 1]]);
+                                let b = u16::from_le_bytes([vec1[i * 4 + 2], vec1[i * 4 + 3]]);
+                                res[i * 2..i * 2 + 2].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                            }
+                            if !is_64 {
+                                for i in 0..2 {
+                                    let a = u16::from_le_bytes([vec2[i * 4], vec2[i * 4 + 1]]);
+                                    let b = u16::from_le_bytes([vec2[i * 4 + 2], vec2[i * 4 + 3]]);
+                                    res[4 + i * 2..4 + i * 2 + 2].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                                }
+                            }
+                        }
+                        4 => {
+                            let count = if is_64 { 1 } else { 2 };
+                            for i in 0..count {
+                                let a = u32::from_le_bytes(vec1[i * 8..i * 8 + 4].try_into().unwrap());
+                                let b = u32::from_le_bytes(vec1[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+                                res[i * 4..i * 4 + 4].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                            }
+                            if !is_64 {
+                                let a = u32::from_le_bytes(vec2[0..4].try_into().unwrap());
+                                let b = u32::from_le_bytes(vec2[4..8].try_into().unwrap());
+                                res[8..12].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                            }
+                        }
+                        _ => {
+                            let a = u64::from_le_bytes(vec1[..8].try_into().unwrap());
+                            let b = u64::from_le_bytes(vec1[8..16].try_into().unwrap());
+                            res[..8].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                            if !is_64 {
+                                let c = u64::from_le_bytes(vec2[..8].try_into().unwrap());
+                                let d = u64::from_le_bytes(vec2[8..16].try_into().unwrap());
+                                res[8..16].copy_from_slice(&c.wrapping_add(d).to_le_bytes());
+                            }
+                        }
+                    }
                     if let Some(reg) = ops.get(0).and_then(get_op_reg) {
                         if let Some(idx) = v_reg_idx(reg) {
                             ctx.v[idx] = res;
                         } else {
-                            set_reg_val(reg, v1_lo.wrapping_add(v1_hi), ctx);
+                            let val = u64::from_le_bytes(res[..8].try_into().unwrap());
+                            set_reg_val(reg, val, ctx);
                         }
                     }
                 }
@@ -1598,17 +1724,38 @@ impl Interpreter {
                 let ops = inst.operands();
                 if ops.len() >= 3 {
                     let vec1 = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or([0u8; 16]);
-                    let shift = (get_operand_val(&ops[2], ctx) as u32) & 0x1f;
+                    let shift = (get_operand_val(&ops[2], ctx) as u32) & 0x3f;
                     let is_high = inst.op() == Op::SHRN2;
                     let mut res = if is_high {
                         ops.get(0).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or([0u8; 16])
                     } else {
                         [0u8; 16]
                     };
-                    let start = if is_high { 8 } else { 0 };
-                    for i in 0..8 {
-                        let h = u16::from_le_bytes([vec1[i * 2], vec1[i * 2 + 1]]);
-                        res[start + i] = ((h >> shift) & 0xff) as u8;
+                    let elem_sz = get_vec_elem_size(&ops[1]);
+                    match elem_sz {
+                        4 => {
+                            let start = if is_high { 8 } else { 0 };
+                            for i in 0..4 {
+                                let w = u32::from_le_bytes(vec1[i * 4..i * 4 + 4].try_into().unwrap());
+                                let val = ((w >> shift) & 0xffff) as u16;
+                                res[start + i * 2..start + i * 2 + 2].copy_from_slice(&val.to_le_bytes());
+                            }
+                        }
+                        8 => {
+                            let start = if is_high { 8 } else { 0 };
+                            for i in 0..2 {
+                                let d = u64::from_le_bytes(vec1[i * 8..i * 8 + 8].try_into().unwrap());
+                                let val = ((d >> shift) & 0xffffffff) as u32;
+                                res[start + i * 4..start + i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+                            }
+                        }
+                        _ => {
+                            let start = if is_high { 8 } else { 0 };
+                            for i in 0..8 {
+                                let h = u16::from_le_bytes([vec1[i * 2], vec1[i * 2 + 1]]);
+                                res[start + i] = ((h >> shift) & 0xff) as u8;
+                            }
+                        }
                     }
                     if let Some(reg) = ops.get(0).and_then(get_op_reg) {
                         if let Some(idx) = v_reg_idx(reg) {
@@ -1627,31 +1774,74 @@ impl Interpreter {
                     let vec2 = if ops.len() >= 3 {
                         ops.get(2).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or(vec1)
                     } else { vec1 };
+                    let elem_sz = get_vec_elem_size(&ops[0]);
+                    let is_64 = is_64bit_vector(&ops[0]);
                     let mut res = [0u8; 16];
-
-                    let v1_0 = u32::from_le_bytes(vec1[0..4].try_into().unwrap());
-                    let v1_1 = u32::from_le_bytes(vec1[4..8].try_into().unwrap());
-                    let v1_2 = u32::from_le_bytes(vec1[8..12].try_into().unwrap());
-                    let v1_3 = u32::from_le_bytes(vec1[12..16].try_into().unwrap());
-
-                    let v2_0 = u32::from_le_bytes(vec2[0..4].try_into().unwrap());
-                    let v2_1 = u32::from_le_bytes(vec2[4..8].try_into().unwrap());
-                    let v2_2 = u32::from_le_bytes(vec2[8..12].try_into().unwrap());
-                    let v2_3 = u32::from_le_bytes(vec2[12..16].try_into().unwrap());
-
-                    let calc = |a: u32, b: u32| match inst.op() {
-                        Op::UMAXP => a.max(b),
-                        Op::UMINP => a.min(b),
-                        Op::SMAXP => (a as i32).max(b as i32) as u32,
-                        Op::SMINP => (a as i32).min(b as i32) as u32,
-                        _ => 0,
-                    };
-
-                    res[0..4].copy_from_slice(&calc(v1_0, v1_1).to_le_bytes());
-                    res[4..8].copy_from_slice(&calc(v1_2, v1_3).to_le_bytes());
-                    res[8..12].copy_from_slice(&calc(v2_0, v2_1).to_le_bytes());
-                    res[12..16].copy_from_slice(&calc(v2_2, v2_3).to_le_bytes());
-
+                    match elem_sz {
+                        1 => {
+                            let calc_u8 = |a: u8, b: u8| match inst.op() {
+                                Op::UMAXP => a.max(b),
+                                Op::UMINP => a.min(b),
+                                Op::SMAXP => (a as i8).max(b as i8) as u8,
+                                Op::SMINP => (a as i8).min(b as i8) as u8,
+                                _ => 0,
+                            };
+                            let count = if is_64 { 4 } else { 8 };
+                            for i in 0..count {
+                                res[i] = calc_u8(vec1[i * 2], vec1[i * 2 + 1]);
+                            }
+                            if !is_64 {
+                                for i in 0..8 {
+                                    res[8 + i] = calc_u8(vec2[i * 2], vec2[i * 2 + 1]);
+                                }
+                            }
+                        }
+                        2 => {
+                            let calc_u16 = |a: u16, b: u16| match inst.op() {
+                                Op::UMAXP => a.max(b),
+                                Op::UMINP => a.min(b),
+                                Op::SMAXP => (a as i16).max(b as i16) as u16,
+                                Op::SMINP => (a as i16).min(b as i16) as u16,
+                                _ => 0,
+                            };
+                            let count = if is_64 { 2 } else { 4 };
+                            for i in 0..count {
+                                let a = u16::from_le_bytes([vec1[i * 4], vec1[i * 4 + 1]]);
+                                let b = u16::from_le_bytes([vec1[i * 4 + 2], vec1[i * 4 + 3]]);
+                                res[i * 2..i * 2 + 2].copy_from_slice(&calc_u16(a, b).to_le_bytes());
+                            }
+                            if !is_64 {
+                                for i in 0..4 {
+                                    let a = u16::from_le_bytes([vec2[i * 4], vec2[i * 4 + 1]]);
+                                    let b = u16::from_le_bytes([vec2[i * 4 + 2], vec2[i * 4 + 3]]);
+                                    res[8 + i * 2..8 + i * 2 + 2].copy_from_slice(&calc_u16(a, b).to_le_bytes());
+                                }
+                            }
+                        }
+                        4 => {
+                            let calc_u32 = |a: u32, b: u32| match inst.op() {
+                                Op::UMAXP => a.max(b),
+                                Op::UMINP => a.min(b),
+                                Op::SMAXP => (a as i32).max(b as i32) as u32,
+                                Op::SMINP => (a as i32).min(b as i32) as u32,
+                                _ => 0,
+                            };
+                            let count = if is_64 { 1 } else { 2 };
+                            for i in 0..count {
+                                let a = u32::from_le_bytes(vec1[i * 8..i * 8 + 4].try_into().unwrap());
+                                let b = u32::from_le_bytes(vec1[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+                                res[i * 4..i * 4 + 4].copy_from_slice(&calc_u32(a, b).to_le_bytes());
+                            }
+                            if !is_64 {
+                                for i in 0..2 {
+                                    let a = u32::from_le_bytes(vec2[i * 8..i * 8 + 4].try_into().unwrap());
+                                    let b = u32::from_le_bytes(vec2[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+                                    res[8 + i * 4..8 + i * 4 + 4].copy_from_slice(&calc_u32(a, b).to_le_bytes());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     if let Some(reg) = ops.get(0).and_then(get_op_reg) {
                         if let Some(idx) = v_reg_idx(reg) {
                             ctx.v[idx] = res;
@@ -1686,31 +1876,116 @@ impl Interpreter {
                     if let (Some(r1), Some(r2)) = (r1, r2) {
                         let idx1 = v_reg_idx(r1).unwrap_or(0);
                         let idx2 = v_reg_idx(r2).unwrap_or(0);
+                        let elem_sz = get_vec_elem_size(&ops[1]);
                         let is_64 = is_64bit_vector(&ops[1]);
-                        let count = if is_64 { 8 } else { 16 };
                         let mut res = [0u8; 16];
-                        match inst.op() {
-                            Op::ADDV => {
-                                let sum: u64 = ctx.v[idx2][..count].iter().map(|&b| b as u64).sum();
-                                res[..8].copy_from_slice(&sum.to_le_bytes());
+                        match elem_sz {
+                            1 => {
+                                let count = if is_64 { 8 } else { 16 };
+                                match inst.op() {
+                                    Op::ADDV => {
+                                        let sum: u64 = ctx.v[idx2][..count].iter().map(|&b| b as u64).sum();
+                                        res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::UMAXV => {
+                                        res[0] = ctx.v[idx2][..count].iter().copied().max().unwrap_or(0);
+                                    }
+                                    Op::UMINV => {
+                                        res[0] = ctx.v[idx2][..count].iter().copied().min().unwrap_or(0);
+                                    }
+                                    Op::SMAXV => {
+                                        res[0] = ctx.v[idx2][..count].iter().map(|&b| b as i8).max().unwrap_or(0) as u8;
+                                    }
+                                    Op::SMINV => {
+                                        res[0] = ctx.v[idx2][..count].iter().map(|&b| b as i8).min().unwrap_or(0) as u8;
+                                    }
+                                    _ => {}
+                                }
                             }
-                            Op::UMAXV => {
-                                let max_val = ctx.v[idx2][..count].iter().copied().max().unwrap_or(0);
-                                res[0] = max_val;
+                            2 => {
+                                let count = if is_64 { 4 } else { 8 };
+                                let slice = &ctx.v[idx2];
+                                let elems: Vec<u16> = (0..count).map(|i| u16::from_le_bytes([slice[i*2], slice[i*2+1]])).collect();
+                                match inst.op() {
+                                    Op::ADDV => {
+                                        let sum: u64 = elems.iter().map(|&h| h as u64).sum();
+                                        res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::UMAXV => {
+                                        let m = elems.iter().copied().max().unwrap_or(0);
+                                        res[..2].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::UMINV => {
+                                        let m = elems.iter().copied().min().unwrap_or(0);
+                                        res[..2].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMAXV => {
+                                        let m = elems.iter().map(|&h| h as i16).max().unwrap_or(0) as u16;
+                                        res[..2].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMINV => {
+                                        let m = elems.iter().map(|&h| h as i16).min().unwrap_or(0) as u16;
+                                        res[..2].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    _ => {}
+                                }
                             }
-                            Op::UMINV => {
-                                let min_val = ctx.v[idx2][..count].iter().copied().min().unwrap_or(0);
-                                res[0] = min_val;
+                            4 => {
+                                let count = if is_64 { 2 } else { 4 };
+                                let slice = &ctx.v[idx2];
+                                let elems: Vec<u32> = (0..count).map(|i| u32::from_le_bytes(slice[i*4..i*4+4].try_into().unwrap())).collect();
+                                match inst.op() {
+                                    Op::ADDV => {
+                                        let sum: u64 = elems.iter().map(|&w| w as u64).sum();
+                                        res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::UMAXV => {
+                                        let m = elems.iter().copied().max().unwrap_or(0);
+                                        res[..4].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::UMINV => {
+                                        let m = elems.iter().copied().min().unwrap_or(0);
+                                        res[..4].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMAXV => {
+                                        let m = elems.iter().map(|&w| w as i32).max().unwrap_or(0) as u32;
+                                        res[..4].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMINV => {
+                                        let m = elems.iter().map(|&w| w as i32).min().unwrap_or(0) as u32;
+                                        res[..4].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    _ => {}
+                                }
                             }
-                            Op::SMAXV => {
-                                let max_val = ctx.v[idx2][..count].iter().map(|&b| b as i8).max().unwrap_or(0) as u8;
-                                res[0] = max_val;
+                            _ => {
+                                let count = 2;
+                                let slice = &ctx.v[idx2];
+                                let elems: Vec<u64> = (0..count).map(|i| u64::from_le_bytes(slice[i*8..i*8+8].try_into().unwrap())).collect();
+                                match inst.op() {
+                                    Op::ADDV => {
+                                        let sum: u64 = elems.iter().sum();
+                                        res[..8].copy_from_slice(&sum.to_le_bytes());
+                                    }
+                                    Op::UMAXV => {
+                                        let m = elems.iter().copied().max().unwrap_or(0);
+                                        res[..8].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::UMINV => {
+                                        let m = elems.iter().copied().min().unwrap_or(0);
+                                        res[..8].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMAXV => {
+                                        let m = elems.iter().map(|&d| d as i64).max().unwrap_or(0) as u64;
+                                        res[..8].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    Op::SMINV => {
+                                        let m = elems.iter().map(|&d| d as i64).min().unwrap_or(0) as u64;
+                                        res[..8].copy_from_slice(&m.to_le_bytes());
+                                    }
+                                    _ => {}
+                                }
                             }
-                            Op::SMINV => {
-                                let min_val = ctx.v[idx2][..count].iter().map(|&b| b as i8).min().unwrap_or(0) as u8;
-                                res[0] = min_val;
-                            }
-                            _ => {}
                         }
                         ctx.v[idx1] = res;
                     }
@@ -1987,7 +2262,52 @@ impl Interpreter {
                 }
             }
 
-            Op::UBFM | Op::UBFX => {
+            Op::UBFX => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let Some(reg) = get_op_reg(&ops[0]) {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let lsb = (get_operand_val(&ops[2], ctx) as usize) & 63;
+                        let width = (get_operand_val(&ops[3], ctx) as usize) & 63;
+                        let is_32 = is_w_reg(reg);
+                        let n_bits = if is_32 { 32 } else { 64 };
+                        let lsb = lsb % n_bits;
+                        let mask = if width >= n_bits { !0u64 } else { (1u64 << width) - 1 };
+                        let val = (v1 >> lsb) & mask;
+                        if is_32 {
+                            set_reg_val(reg, (val as u32) as u64, ctx);
+                        } else {
+                            set_reg_val(reg, val, ctx);
+                        }
+                    }
+                }
+            }
+            Op::SBFX => {
+                let ops = inst.operands();
+                if ops.len() >= 4 {
+                    if let Some(reg) = get_op_reg(&ops[0]) {
+                        let v1 = get_operand_val(&ops[1], ctx);
+                        let lsb = (get_operand_val(&ops[2], ctx) as usize) & 63;
+                        let width = (get_operand_val(&ops[3], ctx) as usize) & 63;
+                        let is_32 = is_w_reg(reg);
+                        let n_bits = if is_32 { 32 } else { 64 };
+                        let lsb = lsb % n_bits;
+                        let mask = if width >= n_bits { !0u64 } else { (1u64 << width) - 1 };
+                        let raw = (v1 >> lsb) & mask;
+                        let val = if width > 0 && (raw & (1u64 << (width - 1))) != 0 {
+                            raw | !mask
+                        } else {
+                            raw
+                        };
+                        if is_32 {
+                            set_reg_val(reg, (val as u32) as u64, ctx);
+                        } else {
+                            set_reg_val(reg, val, ctx);
+                        }
+                    }
+                }
+            }
+            Op::UBFM => {
                 let ops = inst.operands();
                 if ops.len() >= 4 {
                     if let Some(reg) = get_op_reg(&ops[0]) {
@@ -2018,7 +2338,7 @@ impl Interpreter {
                     }
                 }
             }
-            Op::SBFM | Op::SBFX => {
+            Op::SBFM => {
                 let ops = inst.operands();
                 if ops.len() >= 4 {
                     if let Some(reg) = get_op_reg(&ops[0]) {
@@ -2335,14 +2655,28 @@ impl Interpreter {
         }
 
         let pc = ctx.pc;
+        if pc == 0x4cfee4 {
+            tracing::info!("[Trace parse_common] key_ptr=0x{:x} field_pos={}", ctx.get_x(2), ctx.get_x(3));
+        } else if pc == 0x4cffb4 {
+            let s1 = mem.read_string(ctx.get_x(25)).unwrap_or_default();
+            let s2 = mem.read_string(ctx.get_x(0)).unwrap_or_default();
+            tracing::info!("[Trace parse_common strcmp] key={:?} field={:?}", String::from_utf8_lossy(&s1), String::from_utf8_lossy(&s2));
+        } else if pc == 0x4d006c {
+            tracing::info!("[Trace convert_to_struct]");
+        }
         if let Some(thunk_fn) = thunk_lookup(pc) {
             thunk_fn(ctx, mem).map_err(|e| crate::Error::InterpreterError {
                 pc,
                 reason: format!("Thunk execution error at PC {:#x}: {}", pc, e),
             })?;
-            let lr = ctx.get_x(30);
-            ctx.pc = lr;
-            return Ok(!ctx.exited);
+            if ctx.exited {
+                return Ok(false);
+            }
+            if ctx.pc == pc {
+                let lr = ctx.get_x(30);
+                ctx.pc = lr;
+            }
+            return Ok(true);
         }
 
         Self::step(ctx, mem)

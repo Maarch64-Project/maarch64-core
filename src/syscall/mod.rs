@@ -1,5 +1,28 @@
 use crate::{cpu::CpuContext, memory::MemoryManager, Result};
 
+fn translate_open_flags(aarch64_flags: i32) -> i32 {
+    let mut host_flags = 0;
+    let common_mask = libc::O_ACCMODE | libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY | libc::O_TRUNC | libc::O_APPEND | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    host_flags |= aarch64_flags & common_mask;
+
+    if aarch64_flags & 0x4000 != 0 {
+        host_flags |= libc::O_DIRECTORY;
+    }
+    if aarch64_flags & 0x8000 != 0 {
+        host_flags |= libc::O_NOFOLLOW;
+    }
+    if aarch64_flags & 0x10000 != 0 {
+        host_flags |= libc::O_DIRECT;
+    }
+    if aarch64_flags & 0x40000 != 0 {
+        host_flags |= libc::O_NOATIME;
+    }
+    if aarch64_flags & 0x200000 != 0 {
+        host_flags |= libc::O_PATH;
+    }
+    host_flags
+}
+
 pub struct SyscallDispatcher;
 
 impl SyscallDispatcher {
@@ -92,8 +115,19 @@ impl SyscallDispatcher {
                 let c_path = std::ffi::CString::new(path_bytes)
                     .map_err(|e| crate::Error::LoadError(e.to_string()))?;
 
+                let host_flags = translate_open_flags(flags);
+                tracing::info!("[sys_openat] dfd={} path={:?} flags=0x{:x} -> host_flags=0x{:x}", dfd, c_path, flags, host_flags);
+
+                let path_str = c_path.to_string_lossy();
+                let actual_path = if crate::vfs::Vfs::is_passwd_path(&path_str) {
+                    let tmp_path = crate::vfs::Vfs::prepare_mock_passwd_file();
+                    std::ffi::CString::new(tmp_path.to_str().unwrap()).unwrap()
+                } else {
+                    c_path
+                };
+
                 let res = unsafe {
-                    libc::openat(dfd, c_path.as_ptr(), flags, mode)
+                    libc::openat(dfd, actual_path.as_ptr(), host_flags, mode)
                 };
                 let ret = res as i64;
                 ctx.set_x(0, ret as u64);
@@ -383,16 +417,25 @@ impl SyscallDispatcher {
                 let rptr = ctx.get_x(0);
                 let eptr = ctx.get_x(1);
                 let sptr = ctx.get_x(2);
-                let uid = 1000u32.to_le_bytes();
-                if rptr != 0 { let _ = mem.write(rptr, &uid); }
-                if eptr != 0 { let _ = mem.write(eptr, &uid); }
-                if sptr != 0 { let _ = mem.write(sptr, &uid); }
+                let id = if nr == 147 { unsafe { libc::geteuid() } } else { unsafe { libc::getegid() } };
+                let bytes = id.to_le_bytes();
+                if rptr != 0 { let _ = mem.write(rptr, &bytes); }
+                if eptr != 0 { let _ = mem.write(eptr, &bytes); }
+                if sptr != 0 { let _ = mem.write(sptr, &bytes); }
                 ctx.set_x(0, 0);
                 Ok(0)
             }
             172 | 173 | 174 | 175 | 176 | 177 => {
                 // sys_getpid, sys_getppid, sys_getuid, sys_geteuid, sys_getgid, sys_getegid, sys_gettid
-                let id = 1000i64;
+                let id = match nr {
+                    172 => unsafe { libc::getpid() as i64 },
+                    173 => unsafe { libc::getppid() as i64 },
+                    174 => unsafe { libc::getuid() as i64 },
+                    175 => unsafe { libc::geteuid() as i64 },
+                    176 => unsafe { libc::getgid() as i64 },
+                    177 => unsafe { libc::getegid() as i64 },
+                    _ => 1000i64,
+                };
                 ctx.set_x(0, id as u64);
                 Ok(id)
             }
@@ -516,8 +559,22 @@ impl SyscallDispatcher {
                 ctx.set_x(0, res as u64);
                 Ok(res)
             }
-            25 | 29 | 233 | 261 => {
-                // sys_fcntl(25), sys_ioctl(29), sys_madvise(233), sys_prlimit64(261)
+            29 => {
+                // sys_ioctl(fd, request, argp)
+                let req = ctx.get_x(1);
+                let argp = ctx.get_x(2);
+                if (req & 0xffff) == 0x5413 || (req & 0xffff) == 0x542a {
+                    // TIOCGWINSZ
+                    if argp != 0 {
+                        let winsz: [u8; 8] = [24, 0, 80, 0, 0, 0, 0, 0];
+                        let _ = mem.write(argp, &winsz);
+                    }
+                }
+                ctx.set_x(0, 0);
+                Ok(0)
+            }
+            25 | 233 | 261 => {
+                // sys_fcntl(25), sys_madvise(233), sys_prlimit64(261)
                 ctx.set_x(0, 0);
                 Ok(0)
             }
