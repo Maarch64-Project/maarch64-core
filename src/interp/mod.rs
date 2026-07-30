@@ -1326,6 +1326,116 @@ impl Interpreter {
                     }
                 }
             }
+            Op::USHL | Op::SHL | Op::SSHL => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Some(rd) = get_op_reg(&ops[0]) {
+                        if let Some(idx0) = v_reg_idx(rd) {
+                            let elem_sz = get_vec_elem_size(&ops[0]);
+                            let vn = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i]).unwrap_or([0u8; 16]);
+                            let shift_vec = if ops.len() >= 3 {
+                                ops.get(2).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i])
+                            } else { None };
+
+                            let imm_shift = if shift_vec.is_none() && ops.len() >= 3 {
+                                get_operand_val(&ops[2], ctx) as i32
+                            } else { 0 };
+
+                            let mut res = [0u8; 16];
+                            let num_elems = 16 / elem_sz;
+                            for i in 0..num_elems {
+                                let shift = if let Some(svec) = shift_vec {
+                                    match elem_sz {
+                                        1 => svec[i] as i8 as i32,
+                                        2 => u16::from_le_bytes(svec[i*2..i*2+2].try_into().unwrap()) as i16 as i32,
+                                        4 => u32::from_le_bytes(svec[i*4..i*4+4].try_into().unwrap()) as i32,
+                                        _ => u64::from_le_bytes(svec[i*8..i*8+8].try_into().unwrap()) as i64 as i32,
+                                    }
+                                } else {
+                                    imm_shift
+                                };
+
+                                match elem_sz {
+                                    1 => {
+                                        let val = vn[i];
+                                        res[i] = if shift >= 0 { val.wrapping_shl(shift as u32) } else { val.wrapping_shr((-shift) as u32) };
+                                    }
+                                    2 => {
+                                        let val = u16::from_le_bytes(vn[i*2..i*2+2].try_into().unwrap());
+                                        let s_res = if shift >= 0 { val.wrapping_shl(shift as u32) } else { val.wrapping_shr((-shift) as u32) };
+                                        res[i*2..i*2+2].copy_from_slice(&s_res.to_le_bytes());
+                                    }
+                                    4 => {
+                                        let val = u32::from_le_bytes(vn[i*4..i*4+4].try_into().unwrap());
+                                        let s_res = if shift >= 0 { val.wrapping_shl(shift as u32) } else { val.wrapping_shr((-shift) as u32) };
+                                        res[i*4..i*4+4].copy_from_slice(&s_res.to_le_bytes());
+                                    }
+                                    _ => {
+                                        let val = u64::from_le_bytes(vn[i*8..i*8+8].try_into().unwrap());
+                                        let s_res = if shift >= 0 { val.wrapping_shl(shift as u32) } else { val.wrapping_shr((-shift) as u32) };
+                                        res[i*8..i*8+8].copy_from_slice(&s_res.to_le_bytes());
+                                    }
+                                }
+                            }
+                            ctx.v[idx0] = res;
+                        }
+                    }
+                }
+            }
+            Op::CMEQ | Op::CMHI | Op::CMHS | Op::CMGT | Op::CMGE | Op::CMTST => {
+                let ops = inst.operands();
+                if ops.len() >= 2 {
+                    if let Some(rd) = get_op_reg(&ops[0]) {
+                        if let Some(idx0) = v_reg_idx(rd) {
+                            let elem_sz = get_vec_elem_size(&ops[0]);
+                            let vec1 = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i]).unwrap_or([0u8; 16]);
+                            let vec2 = if ops.len() >= 3 {
+                                ops.get(2).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i])
+                            } else { None };
+                            let imm_val = if vec2.is_none() && ops.len() >= 3 {
+                                get_operand_val(&ops[2], ctx)
+                            } else { 0 };
+
+                            let mut res = [0u8; 16];
+                            let num_elems = 16 / elem_sz;
+                            for i in 0..num_elems {
+                                let (v1, v2) = match elem_sz {
+                                    1 => (vec1[i] as u64, vec2.map(|v| v[i] as u64).unwrap_or(imm_val)),
+                                    2 => (u16::from_le_bytes(vec1[i*2..i*2+2].try_into().unwrap()) as u64, vec2.map(|v| u16::from_le_bytes(v[i*2..i*2+2].try_into().unwrap()) as u64).unwrap_or(imm_val)),
+                                    4 => (u32::from_le_bytes(vec1[i*4..i*4+4].try_into().unwrap()) as u64, vec2.map(|v| u32::from_le_bytes(v[i*4..i*4+4].try_into().unwrap()) as u64).unwrap_or(imm_val)),
+                                    _ => (u64::from_le_bytes(vec1[i*8..i*8+8].try_into().unwrap()), vec2.map(|v| u64::from_le_bytes(v[i*8..i*8+8].try_into().unwrap())).unwrap_or(imm_val)),
+                                };
+
+                                let cond = match inst.op() {
+                                    Op::CMEQ => v1 == v2,
+                                    Op::CMHI => v1 > v2,
+                                    Op::CMHS => v1 >= v2,
+                                    Op::CMGT => match elem_sz {
+                                        1 => (v1 as i8) > (v2 as i8),
+                                        2 => (v1 as i16) > (v2 as i16),
+                                        4 => (v1 as i32) > (v2 as i32),
+                                        _ => (v1 as i64) > (v2 as i64),
+                                    },
+                                    Op::CMGE => match elem_sz {
+                                        1 => (v1 as i8) >= (v2 as i8),
+                                        2 => (v1 as i16) >= (v2 as i16),
+                                        4 => (v1 as i32) >= (v2 as i32),
+                                        _ => (v1 as i64) >= (v2 as i64),
+                                    },
+                                    Op::CMTST => (v1 & v2) != 0,
+                                    _ => false,
+                                };
+
+                                let mask = if cond { 0xffu8 } else { 0x00u8 };
+                                for k in 0..elem_sz {
+                                    res[i * elem_sz + k] = mask;
+                                }
+                            }
+                            ctx.v[idx0] = res;
+                        }
+                    }
+                }
+            }
             Op::REV => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
@@ -1471,74 +1581,6 @@ impl Interpreter {
                             truncated << lsb
                         };
                         set_reg_val(reg, res, ctx);
-                    }
-                }
-            }
-            Op::CMHS | Op::CMHI => {
-                let ops = inst.operands();
-                if ops.len() >= 2 {
-                    let vec1 = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i]).unwrap_or([0u8; 16]);
-                    let vec2 = if ops.len() >= 3 {
-                        if let Some(r2) = ops.get(2).and_then(get_op_reg) {
-                            if let Some(idx) = v_reg_idx(r2) { ctx.v[idx] } else { [0u8; 16] }
-                        } else {
-                            let b = get_operand_val(&ops[2], ctx) as u8;
-                            [b; 16]
-                        }
-                    } else {
-                        [0u8; 16]
-                    };
-                    let mut res = [0u8; 16];
-                    for i in 0..16 {
-                        let cond = if inst.op() == Op::CMHS { vec1[i] >= vec2[i] } else { vec1[i] > vec2[i] };
-                        res[i] = if cond { 0xff } else { 0x00 };
-                    }
-                    if let Some(reg) = get_op_reg(&ops[0]) {
-                        if let Some(idx) = v_reg_idx(reg) {
-                            ctx.v[idx] = res;
-                        } else {
-                            let val = u64::from_le_bytes(res[..8].try_into().unwrap());
-                            set_reg_val(reg, val, ctx);
-                        }
-                    }
-                }
-            }
-            Op::CMEQ | Op::CMGE | Op::CMGT | Op::CMLE | Op::CMLT | Op::CMTST => {
-                let ops = inst.operands();
-                if ops.len() >= 2 {
-                    let vec1 = ops.get(1).and_then(get_op_reg).and_then(v_reg_idx).map(|i| ctx.v[i]).unwrap_or([0u8; 16]);
-                    let vec2 = if ops.len() >= 3 {
-                        if let Some(r2) = ops.get(2).and_then(get_op_reg) {
-                            if let Some(idx) = v_reg_idx(r2) { ctx.v[idx] } else { [0u8; 16] }
-                        } else {
-                            let b = get_operand_val(&ops[2], ctx) as u8;
-                            [b; 16]
-                        }
-                    } else {
-                        [0u8; 16]
-                    };
-                    let mut res = [0u8; 16];
-                    let is_64 = is_64bit_vector(&ops[0]);
-                    let count = if is_64 { 8 } else { 16 };
-                    for i in 0..count {
-                        let cond = match inst.op() {
-                            Op::CMEQ => vec1[i] == vec2[i],
-                            Op::CMGE => (vec1[i] as i8) >= (vec2[i] as i8),
-                            Op::CMGT => (vec1[i] as i8) > (vec2[i] as i8),
-                            Op::CMLE => (vec1[i] as i8) <= (vec2[i] as i8),
-                            Op::CMLT => (vec1[i] as i8) < (vec2[i] as i8),
-                            Op::CMTST => (vec1[i] & vec2[i]) != 0,
-                            _ => false,
-                        };
-                        res[i] = if cond { 0xff } else { 0x00 };
-                    }
-                    if let Some(reg) = get_op_reg(&ops[0]) {
-                        if let Some(idx) = v_reg_idx(reg) {
-                            ctx.v[idx] = res;
-                        } else {
-                            let val = u64::from_le_bytes(res[..8].try_into().unwrap());
-                            set_reg_val(reg, val, ctx);
-                        }
                     }
                 }
             }
