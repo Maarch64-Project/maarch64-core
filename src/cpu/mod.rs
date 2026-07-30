@@ -67,4 +67,32 @@ impl CpuContext {
         if v { flags |= FLAG_V; }
         self.pstate = (self.pstate & 0x0fffffff) | flags;
     }
+    pub fn get_v_u64(&self, reg: usize) -> u64 {
+        if reg < 32 {
+            u64::from_le_bytes(self.v[reg][0..8].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    pub fn set_v_u64(&mut self, reg: usize, val: u64) {
+        if reg < 32 {
+            self.v[reg][0..8].copy_from_slice(&val.to_le_bytes());
+            self.v[reg][8..16].fill(0);
+        }
+    }
+
+    pub fn get_v_u128(&self, reg: usize) -> u128 {
+        if reg < 32 {
+            u128::from_le_bytes(self.v[reg])
+        } else {
+            0
+        }
+    }
+
+    pub fn set_v_u128(&mut self, reg: usize, val: u128) {
+        if reg < 32 {
+            self.v[reg].copy_from_slice(&val.to_le_bytes());
+        }
+    }
 }

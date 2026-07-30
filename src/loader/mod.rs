@@ -79,6 +79,8 @@ impl ElfLoader {
 
         // Map 128KB Thunk Trampoline & Data Symbol page at 0x7f000000
         let _ = mem.map_anonymous(0x7f000000, 0x20000);
+        // Map 64KB TLS (Thread Local Storage) page at 0x7f020000
+        let _ = mem.map_anonymous(0x7f020000, 0x10000);
         // Initialize default values for data symbols
         let _ = mem.write(0x7f010300, &1u32.to_le_bytes()); // optind = 1
         let _ = mem.write(0x7f010310, &1u32.to_le_bytes()); // opterr = 1

@@ -436,7 +436,7 @@ impl SyscallDispatcher {
                 Ok(0)
             }
             172 | 173 | 174 | 175 | 176 | 177 => {
-                // sys_getpid, sys_getppid, sys_getuid, sys_geteuid, sys_getgid, sys_getegid, sys_gettid
+                // sys_getpid, sys_getppid, sys_getuid, sys_geteuid, sys_getgid, sys_getegid
                 let id = match nr {
                     172 => unsafe { libc::getpid() as i64 },
                     173 => unsafe { libc::getppid() as i64 },
@@ -448,6 +448,26 @@ impl SyscallDispatcher {
                 };
                 ctx.set_x(0, id as u64);
                 Ok(id)
+            }
+            98 => {
+                // sys_futex(uaddr, futex_op, val, timeout, uaddr2, val3)
+                let uaddr = ctx.get_x(0);
+                let op = ctx.get_x(1) as i32 & 0x7f; // FUTEX_CMD_MASK
+                if op == 0 { // FUTEX_WAIT
+                    let val = ctx.get_x(2) as u32;
+                    let cur_val = mem.read(uaddr, 4).ok().map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                    if cur_val != val {
+                        let err = -11i64; // -EAGAIN
+                        ctx.set_x(0, err as u64);
+                        Ok(err)
+                    } else {
+                        ctx.set_x(0, 0);
+                        Ok(0)
+                    }
+                } else { // FUTEX_WAKE / other
+                    ctx.set_x(0, 0);
+                    Ok(0)
+                }
             }
             78 => {
                 // sys_readlinkat(dirfd, pathname, buf, bufsz)
