@@ -155,6 +155,13 @@ impl MemoryManager {
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        if addr >= 0x5000_0000_0000 {
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(addr as *mut u8, data.len());
+                slice.copy_from_slice(data);
+            }
+            return Ok(());
+        }
         let mut bytes_written = 0;
         while bytes_written < data.len() {
             let cur_addr = addr + bytes_written as u64;
@@ -186,6 +193,12 @@ impl MemoryManager {
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
+        }
+        if addr >= 0x5000_0000_0000 {
+            unsafe {
+                let slice = std::slice::from_raw_parts(addr as *const u8, len);
+                return Ok(slice.to_vec());
+            }
         }
         for seg in &self.segments {
             if addr >= seg.addr && addr + (len as u64) <= seg.addr + (seg.size as u64) {
