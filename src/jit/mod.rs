@@ -1,54 +1,117 @@
-use crate::{cpu::CpuContext, memory::MemoryManager, Result};
-use bad64::{decode, Instruction, Op};
+use crate::{cpu::CpuContext, memory::MemoryManager, Error, Result};
+use bad64::{decode, Op, Reg, Operand, Imm};
+use cranelift_codegen::ir::{types, AbiParam, MemFlags, InstBuilder};
+use cranelift_codegen::Context as CodeGenContext;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Linkage, Module};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
-pub struct BasicBlock {
+pub type JitBlockFn = unsafe extern "C" fn(*mut CpuContext, *mut MemoryManager) -> u64;
+
+#[derive(Clone)]
+pub struct CompiledBlock {
     pub start_pc: u64,
     pub end_pc: u64,
-    pub instructions: Vec<Instruction>,
-    pub successor_pcs: Vec<u64>,
+    pub func_ptr: JitBlockFn,
 }
 
-#[derive(Debug)]
-pub struct JitCache {
-    blocks: HashMap<u64, BasicBlock>,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub chained_jumps: u64,
+pub struct JitEngine {
+    builder_ctx: FunctionBuilderContext,
+    ctx: CodeGenContext,
+    module: JITModule,
+    cache: HashMap<u64, CompiledBlock>,
+    pub hits: u64,
+    pub misses: u64,
 }
 
-impl JitCache {
+// Retain JitCache alias for backwards compatibility
+pub type JitCache = JitEngine;
+
+fn imm_to_u64(imm: &Imm) -> u64 {
+    match imm {
+        Imm::Signed(i) => *i as u64,
+        Imm::Unsigned(u) => *u,
+    }
+}
+
+fn get_op_reg(op: &Operand) -> Option<Reg> {
+    match op {
+        Operand::Reg { reg, .. } => Some(*reg),
+        Operand::QualReg { reg, .. } => Some(*reg),
+        Operand::ShiftReg { reg, .. } => Some(*reg),
+        _ => None,
+    }
+}
+
+fn get_reg_offset(reg: Reg) -> i32 {
+    match reg {
+        Reg::SP | Reg::WSP => 248,
+        _ => {
+            let idx = reg as usize;
+            if idx <= 30 { (idx * 8) as i32 } else { 248 }
+        }
+    }
+}
+
+impl JitEngine {
     pub fn new() -> Self {
+        let builder = JITBuilder::new(cranelift_module::default_libcall_names()).unwrap();
+        let module = JITModule::new(builder);
+        let ctx = module.make_context();
+        let builder_ctx = FunctionBuilderContext::new();
+
         Self {
-            blocks: HashMap::new(),
-            cache_hits: 0,
-            cache_misses: 0,
-            chained_jumps: 0,
+            builder_ctx,
+            ctx,
+            module,
+            cache: HashMap::new(),
+            hits: 0,
+            misses: 0,
         }
     }
 
-    pub fn contains(&self, pc: u64) -> bool {
-        self.blocks.contains_key(&pc)
+    pub fn is_cached(&self, pc: u64) -> bool {
+        self.cache.contains_key(&pc)
     }
 
-    pub fn get_block(&mut self, pc: u64) -> Option<&BasicBlock> {
-        if self.blocks.contains_key(&pc) {
-            self.cache_hits += 1;
-            self.blocks.get(&pc)
+    pub fn get_block(&mut self, pc: u64) -> Option<&CompiledBlock> {
+        if self.cache.contains_key(&pc) {
+            self.hits += 1;
+            self.cache.get(&pc)
         } else {
-            self.cache_misses += 1;
+            self.misses += 1;
             None
         }
     }
 
-    pub fn compile_block(&mut self, start_pc: u64, mem: &MemoryManager) -> Result<&BasicBlock> {
-        let mut cur_pc = start_pc;
-        let mut instructions = Vec::new();
-        let max_block_instructions = 500;
-        let mut successor_pcs = Vec::new();
+    pub fn compile_and_get(&mut self, start_pc: u64, mem: &MemoryManager) -> Result<CompiledBlock> {
+        if let Some(block) = self.cache.get(&start_pc) {
+            return Ok(block.clone());
+        }
 
-        while instructions.len() < max_block_instructions {
+        self.ctx.clear();
+        let pointer_type = self.module.target_config().pointer_type();
+
+        // Signature: fn(ctx: *mut CpuContext, mem: *mut MemoryManager) -> u64 (next_pc)
+        self.ctx.func.signature.params.push(AbiParam::new(pointer_type)); // ctx
+        self.ctx.func.signature.params.push(AbiParam::new(pointer_type)); // mem
+        self.ctx.func.signature.returns.push(AbiParam::new(types::I64)); // next_pc
+
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let ctx_ptr = builder.block_params(entry_block)[0];
+
+        let mut cur_pc = start_pc;
+        let max_insts = 100;
+        let mut inst_count = 0;
+        let mut ended_block = false;
+
+        while inst_count < max_insts && !ended_block {
             let ins_bytes = match mem.read(cur_pc, 4) {
                 Ok(b) => b,
                 Err(_) => break,
@@ -60,93 +123,162 @@ impl JitCache {
             };
 
             let op = inst.op();
-            instructions.push(inst);
-            cur_pc += 4;
+            let next_pc = cur_pc + 4;
+            let operands = inst.operands();
 
-            // Bounded basic block ends at branch, jump, or system call
-            if matches!(
-                op,
-                Op::B
-                    | Op::BL
-                    | Op::RET
-                    | Op::CBZ
-                    | Op::CBNZ
-                    | Op::BR
-                    | Op::BLR
-                    | Op::SVC
-            ) {
-                // Record fall-through and target successors if statically computable
-                successor_pcs.push(cur_pc);
-                break;
+            match op {
+                Op::NOP => {}
+                Op::MOV | Op::ORR => {
+                    if operands.len() >= 2 {
+                        if let (Some(rd), Some(rn)) = (get_op_reg(&operands[0]), get_op_reg(&operands[1])) {
+                            let off_n = get_reg_offset(rn);
+                            let val_n = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, off_n);
+                            let off_d = get_reg_offset(rd);
+                            builder.ins().store(MemFlags::trusted(), val_n, ctx_ptr, off_d);
+                        } else if let Some(rd) = get_op_reg(&operands[0]) {
+                            let imm_val = match &operands[1] {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                Operand::Label(imm) => imm_to_u64(imm),
+                                _ => 0,
+                            };
+                            let val_imm = builder.ins().iconst(types::I64, imm_val as i64);
+                            let off_d = get_reg_offset(rd);
+                            builder.ins().store(MemFlags::trusted(), val_imm, ctx_ptr, off_d);
+                        }
+                    }
+                }
+                Op::ADD => {
+                    if operands.len() >= 3 {
+                        if let (Some(rd), Some(rn), Some(rm)) = (get_op_reg(&operands[0]), get_op_reg(&operands[1]), get_op_reg(&operands[2])) {
+                            let val_n = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rn));
+                            let val_m = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rm));
+                            let res = builder.ins().iadd(val_n, val_m);
+                            builder.ins().store(MemFlags::trusted(), res, ctx_ptr, get_reg_offset(rd));
+                        } else if let (Some(rd), Some(rn)) = (get_op_reg(&operands[0]), get_op_reg(&operands[1])) {
+                            let imm_val = match &operands[2] {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                Operand::Label(imm) => imm_to_u64(imm),
+                                _ => 0,
+                            };
+                            let val_n = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rn));
+                            let val_imm = builder.ins().iconst(types::I64, imm_val as i64);
+                            let res = builder.ins().iadd(val_n, val_imm);
+                            builder.ins().store(MemFlags::trusted(), res, ctx_ptr, get_reg_offset(rd));
+                        }
+                    }
+                }
+                Op::SUB => {
+                    if operands.len() >= 3 {
+                        if let (Some(rd), Some(rn), Some(rm)) = (get_op_reg(&operands[0]), get_op_reg(&operands[1]), get_op_reg(&operands[2])) {
+                            let val_n = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rn));
+                            let val_m = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rm));
+                            let res = builder.ins().isub(val_n, val_m);
+                            builder.ins().store(MemFlags::trusted(), res, ctx_ptr, get_reg_offset(rd));
+                        } else if let (Some(rd), Some(rn)) = (get_op_reg(&operands[0]), get_op_reg(&operands[1])) {
+                            let imm_val = match &operands[2] {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                Operand::Label(imm) => imm_to_u64(imm),
+                                _ => 0,
+                            };
+                            let val_n = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, get_reg_offset(rn));
+                            let val_imm = builder.ins().iconst(types::I64, imm_val as i64);
+                            let res = builder.ins().isub(val_n, val_imm);
+                            builder.ins().store(MemFlags::trusted(), res, ctx_ptr, get_reg_offset(rd));
+                        }
+                    }
+                }
+                Op::B => {
+                    let target_pc = match operands.first() {
+                        Some(Operand::Label(imm)) => imm_to_u64(imm),
+                        _ => next_pc,
+                    };
+                    let ret_val = builder.ins().iconst(types::I64, target_pc as i64);
+                    builder.ins().return_(&[ret_val]);
+                    ended_block = true;
+                }
+                Op::RET => {
+                    let lr_val = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, 30 * 8);
+                    builder.ins().return_(&[lr_val]);
+                    ended_block = true;
+                }
+                Op::BL => {
+                    let lr_val = builder.ins().iconst(types::I64, next_pc as i64);
+                    builder.ins().store(MemFlags::trusted(), lr_val, ctx_ptr, 30 * 8);
+
+                    let target_pc = match operands.first() {
+                        Some(Operand::Label(imm)) => imm_to_u64(imm),
+                        _ => next_pc,
+                    };
+                    let ret_val = builder.ins().iconst(types::I64, target_pc as i64);
+                    builder.ins().return_(&[ret_val]);
+                    ended_block = true;
+                }
+                _ => {
+                    // Fallback to interpreter for unhandled instructions
+                    let ret_val = builder.ins().iconst(types::I64, cur_pc as i64);
+                    builder.ins().return_(&[ret_val]);
+                    ended_block = true;
+                }
             }
+
+            cur_pc += 4;
+            inst_count += 1;
         }
 
-        let block = BasicBlock {
+        if !ended_block {
+            let ret_val = builder.ins().iconst(types::I64, cur_pc as i64);
+            builder.ins().return_(&[ret_val]);
+        }
+
+        builder.finalize();
+
+        let func_id = self.module
+            .declare_function(&format!("jit_block_{:x}", start_pc), Linkage::Local, &self.ctx.func.signature)
+            .map_err(|e| Error::InterpreterError { pc: start_pc, reason: format!("JIT declare error: {}", e) })?;
+
+        self.module
+            .define_function(func_id, &mut self.ctx)
+            .map_err(|e| Error::InterpreterError { pc: start_pc, reason: format!("JIT define error: {}", e) })?;
+
+        self.module.clear_context(&mut self.ctx);
+        self.module.finalize_definitions()
+            .map_err(|e| Error::InterpreterError { pc: start_pc, reason: format!("JIT finalize error: {}", e) })?;
+
+        let raw_ptr = self.module.get_finalized_function(func_id);
+        let func_ptr: JitBlockFn = unsafe { std::mem::transmute(raw_ptr) };
+
+        let block = CompiledBlock {
             start_pc,
             end_pc: cur_pc,
-            instructions,
-            successor_pcs,
+            func_ptr,
         };
 
-        self.blocks.insert(start_pc, block);
-        Ok(self.blocks.get(&start_pc).unwrap())
+        self.cache.insert(start_pc, block.clone());
+        Ok(block)
     }
 
-    pub fn execute_block(
-        block: &BasicBlock,
-        ctx: &mut CpuContext,
-        mem: &mut MemoryManager,
-    ) -> Result<()> {
-        for _inst in &block.instructions {
-            if ctx.exited {
-                break;
-            }
-            crate::interp::Interpreter::step(ctx, mem)?;
-        }
-        Ok(())
+    pub fn execute(&mut self, ctx: &mut CpuContext, mem: &mut MemoryManager) -> Result<bool> {
+        let pc = ctx.pc;
+        let block = self.compile_and_get(pc, mem)?;
+        let next_pc = unsafe { (block.func_ptr)(ctx, mem) };
+        ctx.pc = next_pc;
+        Ok(!ctx.exited)
     }
 
-    /// Execute basic blocks with direct chaining (block-to-block jumps without returning to top-level dispatcher).
     pub fn execute_block_chain(
         &mut self,
         ctx: &mut CpuContext,
         mem: &mut MemoryManager,
         max_chain: usize,
     ) -> Result<bool> {
-        let mut chain_count = 0;
-
-        while chain_count < max_chain {
-            if ctx.exited {
-                return Ok(false);
-            }
-
-            let pc = ctx.pc;
-            if !self.blocks.contains_key(&pc) {
-                if self.compile_block(pc, mem).is_err() {
-                    break;
-                }
-                self.cache_misses += 1;
-            } else {
-                self.cache_hits += 1;
-            }
-
-            let block = match self.blocks.get(&pc) {
-                Some(b) => b.clone(),
-                None => break,
-            };
-
-            Self::execute_block(&block, ctx, mem)?;
-
-            chain_count += 1;
-            if chain_count > 1 {
-                self.chained_jumps += 1;
-            }
-
-            if ctx.exited || ctx.pc == pc {
+        let mut count = 0;
+        while count < max_chain && !ctx.exited {
+            let res = self.execute(ctx, mem)?;
+            if !res {
                 break;
             }
+            count += 1;
         }
-
         Ok(!ctx.exited)
     }
 }
