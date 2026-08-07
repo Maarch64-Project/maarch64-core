@@ -281,7 +281,7 @@ impl ElfLoader {
         }
 
         Ok(LoadedBinary {
-            entry_point,
+            entry_point: file.entry() + load_bias,
             stack_pointer: sp,
             dynamic_thunks,
         })
