@@ -403,22 +403,81 @@ impl Interpreter {
             Op::ADD | Op::ADDS | Op::CMN => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
-                    let (target_reg, op1, op2) = if inst.op() == Op::CMN {
-                        (None, &ops[0], &ops[1])
+                    let target_reg = if inst.op() == Op::CMN {
+                        None
                     } else if ops.len() >= 3 {
-                        (get_op_reg(&ops[0]), &ops[1], &ops[2])
+                        get_op_reg(&ops[0])
                     } else {
-                        (get_op_reg(&ops[0]), &ops[0], &ops[1])
+                        get_op_reg(&ops[0])
                     };
-                    let v1 = get_operand_val(op1, ctx);
-                    let v2 = get_operand_val(op2, ctx);
-                    let (res, overflow) = v1.overflowing_add(v2);
 
                     if let Some(reg) = target_reg {
-                        set_reg_val(reg, res, ctx);
-                    }
+                        if let Some(idx0) = v_reg_idx(reg) {
+                            let op_count = ops.len();
+                            let vec1 = ops.get(if op_count >= 3 { op_count - 2 } else { 0 }).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or([0u8; 16]);
+                            let vec2 = ops.get(op_count - 1).and_then(get_op_reg).and_then(v_reg_idx).map(|idx| ctx.v[idx]).unwrap_or([0u8; 16]);
+                            let elem_sz = get_vec_elem_size(&ops[0]);
+                            let mut res = [0u8; 16];
+                            let num_elems = 16 / elem_sz;
+                            for i in 0..num_elems {
+                                match elem_sz {
+                                    1 => res[i] = vec1[i].wrapping_add(vec2[i]),
+                                    2 => {
+                                        let a = u16::from_le_bytes([vec1[i * 2], vec1[i * 2 + 1]]);
+                                        let b = u16::from_le_bytes([vec2[i * 2], vec2[i * 2 + 1]]);
+                                        res[i * 2..i * 2 + 2].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                                    }
+                                    4 => {
+                                        let a = u32::from_le_bytes(vec1[i * 4..i * 4 + 4].try_into().unwrap());
+                                        let b = u32::from_le_bytes(vec2[i * 4..i * 4 + 4].try_into().unwrap());
+                                        res[i * 4..i * 4 + 4].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                                    }
+                                    _ => {
+                                        let a = u64::from_le_bytes(vec1[i * 8..i * 8 + 8].try_into().unwrap());
+                                        let b = u64::from_le_bytes(vec2[i * 8..i * 8 + 8].try_into().unwrap());
+                                        res[i * 8..i * 8 + 8].copy_from_slice(&a.wrapping_add(b).to_le_bytes());
+                                    }
+                                }
+                            }
+                            ctx.v[idx0] = res;
+                        } else {
+                            let (op1, op2) = if inst.op() == Op::CMN {
+                                (&ops[0], &ops[1])
+                            } else if ops.len() >= 3 {
+                                (&ops[1], &ops[2])
+                            } else {
+                                (&ops[0], &ops[1])
+                            };
+                            let v1 = get_operand_val(op1, ctx);
+                            let v2 = get_operand_val(op2, ctx);
+                            let (res, overflow) = v1.overflowing_add(v2);
+                            set_reg_val(reg, res, ctx);
 
-                    if inst.op() == Op::ADDS || inst.op() == Op::CMN {
+                            if inst.op() == Op::ADDS || inst.op() == Op::CMN {
+                                let is_32 = get_op_reg(op1).map(is_w_reg).unwrap_or(false);
+                                if is_32 {
+                                    let v1_32 = v1 as u32;
+                                    let v2_32 = v2 as u32;
+                                    let (r32, overflow_32) = v1_32.overflowing_add(v2_32);
+                                    let n = (r32 as i32) < 0;
+                                    let z = r32 == 0;
+                                    let c = overflow_32;
+                                    let v = ((v1_32 ^ !v2_32) & (v1_32 ^ r32) & 0x8000_0000) != 0;
+                                    ctx.set_nzcv(n, z, c, v);
+                                } else {
+                                    let n = (res as i64) < 0;
+                                    let z = res == 0;
+                                    let c = overflow;
+                                    let v = ((v1 ^ !v2) & (v1 ^ res) & 0x8000_0000_0000_0000) != 0;
+                                    ctx.set_nzcv(n, z, c, v);
+                                }
+                            }
+                        }
+                    } else if inst.op() == Op::CMN {
+                        let (op1, op2) = (&ops[0], &ops[1]);
+                        let v1 = get_operand_val(op1, ctx);
+                        let v2 = get_operand_val(op2, ctx);
+                        let (res, overflow) = v1.overflowing_add(v2);
                         let is_32 = get_op_reg(op1).map(is_w_reg).unwrap_or(false);
                         if is_32 {
                             let v1_32 = v1 as u32;
@@ -512,7 +571,18 @@ impl Interpreter {
                     if let Some(reg) = get_op_reg(&ops[0]) {
                         let val = get_operand_val(&ops[1], ctx);
                         if let Some(idx) = v_reg_idx(reg) {
-                            ctx.v[idx].fill((val & 0xff) as u8);
+                            let elem_sz = get_vec_elem_size(&ops[0]);
+                            let num_elems = 16 / elem_sz;
+                            let mut res = [0u8; 16];
+                            for i in 0..num_elems {
+                                match elem_sz {
+                                    1 => res[i] = (val & 0xff) as u8,
+                                    2 => res[i*2..i*2+2].copy_from_slice(&((val & 0xffff) as u16).to_le_bytes()),
+                                    4 => res[i*4..i*4+4].copy_from_slice(&((val & 0xffffffff) as u32).to_le_bytes()),
+                                    _ => res[i*8..i*8+8].copy_from_slice(&val.to_le_bytes()),
+                                }
+                            }
+                            ctx.v[idx] = res;
                         } else {
                             set_reg_val(reg, val, ctx);
                         }
@@ -1570,8 +1640,21 @@ impl Interpreter {
                 if ops.len() >= 4 {
                     if let Operand::Reg { reg, .. } = ops[0] {
                         let val = get_operand_val(&ops[1], ctx);
-                        let lsb = get_operand_val(&ops[2], ctx) as u32;
-                        let width = get_operand_val(&ops[3], ctx) as u32;
+                        let arg2 = get_operand_val(&ops[2], ctx);
+                        let arg3 = get_operand_val(&ops[3], ctx);
+                        let is_32 = is_w_reg(reg);
+                        let n_bits = if is_32 { 32u64 } else { 64u64 };
+
+                        let (lsb, width) = if arg2 + arg3 < n_bits {
+                            (arg2, arg3)
+                        } else {
+                            let immr = arg2 % n_bits;
+                            let imms = arg3 % n_bits;
+                            let lsb = (n_bits - immr) % n_bits;
+                            let width = imms + 1;
+                            (lsb, width)
+                        };
+
                         let mask = if width >= 64 { !0u64 } else { (1u64 << width) - 1 };
                         let truncated = val & mask;
                         let res = if inst.op() == Op::SBFIZ && width > 0 && (truncated & (1u64 << (width - 1))) != 0 {
@@ -1706,10 +1789,26 @@ impl Interpreter {
             Op::MVNI => {
                 let ops = inst.operands();
                 if ops.len() >= 2 {
-                    let imm = get_operand_val(&ops[1], ctx);
-                    let res = !imm;
-                    if let Operand::Reg { reg, .. } = ops[0] {
-                        set_reg_val(reg, res, ctx);
+                    if let Some(reg) = get_op_reg(&ops[0]) {
+                        if let Some(idx0) = v_reg_idx(reg) {
+                            let elem_sz = get_vec_elem_size(&ops[0]);
+                            let imm = get_operand_val(&ops[1], ctx);
+                            let not_imm = !imm;
+                            let mut res = [0u8; 16];
+                            let num_elems = 16 / elem_sz;
+                            for i in 0..num_elems {
+                                match elem_sz {
+                                    1 => res[i] = (not_imm & 0xff) as u8,
+                                    2 => res[i*2..i*2+2].copy_from_slice(&((not_imm & 0xffff) as u16).to_le_bytes()),
+                                    4 => res[i*4..i*4+4].copy_from_slice(&((not_imm & 0xffffffff) as u32).to_le_bytes()),
+                                    _ => res[i*8..i*8+8].copy_from_slice(&not_imm.to_le_bytes()),
+                                }
+                            }
+                            ctx.v[idx0] = res;
+                        } else {
+                            let imm = get_operand_val(&ops[1], ctx);
+                            set_reg_val(reg, !imm, ctx);
+                        }
                     }
                 }
             }
