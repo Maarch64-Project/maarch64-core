@@ -1,6 +1,7 @@
 use crate::{cpu::CpuContext, memory::MemoryManager, Error, Result};
 use bad64::{decode, Op, Reg, Operand, Imm};
 use cranelift_codegen::ir::{types, Value, AbiParam, MemFlags, InstBuilder};
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::Context as CodeGenContext;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -52,7 +53,7 @@ fn is_w_reg(reg: Reg) -> bool {
         Reg::W0 | Reg::W1 | Reg::W2 | Reg::W3 | Reg::W4 | Reg::W5 | Reg::W6 | Reg::W7 |
         Reg::W8 | Reg::W9 | Reg::W10 | Reg::W11 | Reg::W12 | Reg::W13 | Reg::W14 | Reg::W15 |
         Reg::W16 | Reg::W17 | Reg::W18 | Reg::W19 | Reg::W20 | Reg::W21 | Reg::W22 | Reg::W23 |
-        Reg::W24 | Reg::W25 | Reg::W26 | Reg::W27 | Reg::W28 | Reg::W29 | Reg::W30 | Reg::WZR
+        Reg::W24 | Reg::W25 | Reg::W26 | Reg::W27 | Reg::W28 | Reg::W29 | Reg::W30 | Reg::WZR | Reg::WSP
     )
 }
 
@@ -89,6 +90,7 @@ fn reg_idx(reg: Reg) -> Option<usize> {
         Reg::X28 | Reg::W28 => Some(28),
         Reg::X29 | Reg::W29 => Some(29),
         Reg::X30 | Reg::W30 => Some(30),
+        Reg::SP | Reg::WSP => Some(31),
         _ => None,
     }
 }
@@ -301,6 +303,136 @@ impl JitEngine {
                     builder.ins().return_(&[ret_val]);
                     ended_block = true;
                     compiled_any = true;
+                }
+                Op::ADRP => {
+                    if let (Some(rd), Some(target_op)) = (operands.first().and_then(get_op_reg), operands.get(1)) {
+                        let page_base = match target_op {
+                            Operand::Label(imm) => imm_to_u64(imm),
+                            _ => cur_pc & !0xFFF,
+                        };
+                        let val_page = builder.ins().iconst(types::I64, page_base as i64);
+                        store_reg(&mut builder, ctx_ptr, rd, val_page);
+                        compiled_any = true;
+                    }
+                }
+                Op::AND => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                        let val_m = if let Some(rm) = operands.get(2).and_then(get_op_reg) {
+                            load_reg(&mut builder, ctx_ptr, rm)
+                        } else {
+                            let imm_val = operands.get(2).map(|op| match op {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                _ => 0,
+                            }).unwrap_or(0);
+                            builder.ins().iconst(types::I64, imm_val as i64)
+                        };
+                        let res = builder.ins().band(val_n, val_m);
+                        store_reg(&mut builder, ctx_ptr, rd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::EOR => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                        let val_m = if let Some(rm) = operands.get(2).and_then(get_op_reg) {
+                            load_reg(&mut builder, ctx_ptr, rm)
+                        } else {
+                            let imm_val = operands.get(2).map(|op| match op {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                _ => 0,
+                            }).unwrap_or(0);
+                            builder.ins().iconst(types::I64, imm_val as i64)
+                        };
+                        let res = builder.ins().bxor(val_n, val_m);
+                        store_reg(&mut builder, ctx_ptr, rd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::LSL => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                        let shift_val = if let Some(rm) = operands.get(2).and_then(get_op_reg) {
+                            load_reg(&mut builder, ctx_ptr, rm)
+                        } else {
+                            let imm_val = operands.get(2).map(|op| match op {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                _ => 0,
+                            }).unwrap_or(0);
+                            builder.ins().iconst(types::I64, imm_val as i64)
+                        };
+                        let res = builder.ins().ishl(val_n, shift_val);
+                        store_reg(&mut builder, ctx_ptr, rd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::LSR => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                        let shift_val = if let Some(rm) = operands.get(2).and_then(get_op_reg) {
+                            load_reg(&mut builder, ctx_ptr, rm)
+                        } else {
+                            let imm_val = operands.get(2).map(|op| match op {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                _ => 0,
+                            }).unwrap_or(0);
+                            builder.ins().iconst(types::I64, imm_val as i64)
+                        };
+                        let res = builder.ins().ushr(val_n, shift_val);
+                        store_reg(&mut builder, ctx_ptr, rd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::ASR => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                        let shift_val = if let Some(rm) = operands.get(2).and_then(get_op_reg) {
+                            load_reg(&mut builder, ctx_ptr, rm)
+                        } else {
+                            let imm_val = operands.get(2).map(|op| match op {
+                                Operand::Imm64 { imm, .. } | Operand::Imm32 { imm, .. } => imm_to_u64(imm),
+                                _ => 0,
+                            }).unwrap_or(0);
+                            builder.ins().iconst(types::I64, imm_val as i64)
+                        };
+                        let res = builder.ins().sshr(val_n, shift_val);
+                        store_reg(&mut builder, ctx_ptr, rd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::CBZ => {
+                    if let (Some(rt), Some(target_op)) = (operands.first().and_then(get_op_reg), operands.get(1)) {
+                        let target_pc = match target_op {
+                            Operand::Label(imm) => imm_to_u64(imm),
+                            _ => next_pc,
+                        };
+                        let val_t = load_reg(&mut builder, ctx_ptr, rt);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        let cond = builder.ins().icmp(IntCC::Equal, val_t, zero);
+                        let ret_target = builder.ins().iconst(types::I64, target_pc as i64);
+                        let ret_next = builder.ins().iconst(types::I64, next_pc as i64);
+                        let res_pc = builder.ins().select(cond, ret_target, ret_next);
+                        builder.ins().return_(&[res_pc]);
+                        ended_block = true;
+                        compiled_any = true;
+                    }
+                }
+                Op::CBNZ => {
+                    if let (Some(rt), Some(target_op)) = (operands.first().and_then(get_op_reg), operands.get(1)) {
+                        let target_pc = match target_op {
+                            Operand::Label(imm) => imm_to_u64(imm),
+                            _ => next_pc,
+                        };
+                        let val_t = load_reg(&mut builder, ctx_ptr, rt);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        let cond = builder.ins().icmp(IntCC::NotEqual, val_t, zero);
+                        let ret_target = builder.ins().iconst(types::I64, target_pc as i64);
+                        let ret_next = builder.ins().iconst(types::I64, next_pc as i64);
+                        let res_pc = builder.ins().select(cond, ret_target, ret_next);
+                        builder.ins().return_(&[res_pc]);
+                        ended_block = true;
+                        compiled_any = true;
+                    }
                 }
                 _ => {
                     if !compiled_any {
