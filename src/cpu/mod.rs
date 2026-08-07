@@ -1,4 +1,5 @@
 /// ARM64 (AArch64) CPU Register State & Execution Context
+#[repr(C)]
 #[derive(Debug, Clone, Default)]
 pub struct CpuContext {
     /// General-purpose registers X0..X30 (X30 is LR)
@@ -9,6 +10,8 @@ pub struct CpuContext {
     pub pc: u64,
     /// Process State (NZCV flags: N=bit31, Z=bit30, C=bit29, V=bit28)
     pub pstate: u32,
+    /// Alignment padding
+    pub _pad: u32,
     /// Floating point / SIMD registers V0..V31 (128-bit each)
     pub v: [[u8; 16]; 32],
     /// Thread ID / Thread Local Storage register (TPIDR_EL0)
