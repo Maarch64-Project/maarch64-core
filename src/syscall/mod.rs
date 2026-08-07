@@ -337,6 +337,37 @@ impl SyscallDispatcher {
                 ctx.set_x(0, 0);
                 Ok(0)
             }
+            220 => {
+                // sys_clone(flags, newsp, parent_tidptr, tls, child_tidptr)
+                let flags = ctx.get_x(0);
+                let newsp = ctx.get_x(1);
+                let parent_tidptr = ctx.get_x(2);
+                let tls = ctx.get_x(3);
+                let child_tidptr = ctx.get_x(4);
+
+                static NEXT_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1001);
+                let child_tid = NEXT_TID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                // CLONE_SETTLS = 0x8000
+                if (flags & 0x8000) != 0 && tls != 0 {
+                    ctx.tpidr_el0 = tls;
+                }
+
+                // CLONE_PARENT_SETTID = 0x0010_0000
+                if (flags & 0x0010_0000) != 0 && parent_tidptr != 0 {
+                    mem.write(parent_tidptr, &child_tid.to_le_bytes())?;
+                }
+
+                // CLONE_CHILD_CLEARTID = 0x0020_0000
+                if (flags & 0x0020_0000) != 0 && child_tidptr != 0 {
+                    mem.write(child_tidptr, &child_tid.to_le_bytes())?;
+                }
+
+                tracing::info!("Syscall 220 sys_clone (flags={:#x}, newsp={:#x}, parent_tidptr={:#x}, tls={:#x}, child_tidptr={:#x}) -> child_tid={}", flags, newsp, parent_tidptr, tls, child_tidptr, child_tid);
+
+                ctx.set_x(0, child_tid as u64);
+                Ok(child_tid as i64)
+            }
             222 => {
                 // sys_mmap(addr, len, prot, flags, fd, offset)
                 let addr = ctx.get_x(0);
