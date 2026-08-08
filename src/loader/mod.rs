@@ -102,7 +102,7 @@ impl ElfLoader {
                     let target_addr = addr + load_bias;
                     let target = reloc.target();
                     if let object::RelocationTarget::Symbol(sym_idx) = target {
-                        if let Some(sym) = sym_idx.0.checked_sub(1).and_then(|i| dyn_syms.get(i)) {
+                        if let Some(sym) = dyn_syms.get(sym_idx.0) {
                             if sym.is_undefined() {
                                 if let Ok(name) = sym.name() {
                                     if !name.is_empty() {
