@@ -273,6 +273,42 @@ impl LinuxSyscall {
                     Ok(child_pid)
                 }
             }
+            98 => {
+                let uaddr = ctx.get_x(0);
+                let futex_op = ctx.get_x(1) as i32 & 0x7f;
+                let val = ctx.get_x(2) as u32;
+                tracing::info!("[Syscall futex] uaddr={:#x}, op={}, val={}", uaddr, futex_op, val);
+                match futex_op {
+                    0 => {
+                        if uaddr != 0 {
+                            if let Ok(data) = mem.read(uaddr, 4) {
+                                let cur_val = u32::from_le_bytes(data.try_into().unwrap());
+                                if cur_val != val {
+                                    ctx.set_x(0, (-11i64) as u64);
+                                    return Ok(-11);
+                                }
+                            }
+                        }
+                        ctx.set_x(0, 0);
+                        Ok(0)
+                    }
+                    1 => {
+                        ctx.set_x(0, val as u64);
+                        Ok(val as i64)
+                    }
+                    _ => {
+                        ctx.set_x(0, 0);
+                        Ok(0)
+                    }
+                }
+            }
+            99 => {
+                let head_ptr = ctx.get_x(0);
+                let len = ctx.get_x(1);
+                tracing::info!("[Syscall set_robust_list] head={:#x}, len={}", head_ptr, len);
+                ctx.set_x(0, 0);
+                Ok(0)
+            }
             63 => {
                 let fd = ctx.get_x(0) as i32;
                 let cmd = ctx.get_x(1) as i32;

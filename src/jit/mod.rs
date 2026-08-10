@@ -57,6 +57,64 @@ fn is_w_reg(reg: Reg) -> bool {
     )
 }
 
+fn v_reg_idx(reg: Reg) -> Option<usize> {
+    match reg {
+        Reg::V0 | Reg::D0 | Reg::S0 | Reg::H0 | Reg::B0 | Reg::Q0 => Some(0),
+        Reg::V1 | Reg::D1 | Reg::S1 | Reg::H1 | Reg::B1 | Reg::Q1 => Some(1),
+        Reg::V2 | Reg::D2 | Reg::S2 | Reg::H2 | Reg::B2 | Reg::Q2 => Some(2),
+        Reg::V3 | Reg::D3 | Reg::S3 | Reg::H3 | Reg::B3 | Reg::Q3 => Some(3),
+        Reg::V4 | Reg::D4 | Reg::S4 | Reg::H4 | Reg::B4 | Reg::Q4 => Some(4),
+        Reg::V5 | Reg::D5 | Reg::S5 | Reg::H5 | Reg::B5 | Reg::Q5 => Some(5),
+        Reg::V6 | Reg::D6 | Reg::S6 | Reg::H6 | Reg::B6 | Reg::Q6 => Some(6),
+        Reg::V7 | Reg::D7 | Reg::S7 | Reg::H7 | Reg::B7 | Reg::Q7 => Some(7),
+        Reg::V8 | Reg::D8 | Reg::S8 | Reg::H8 | Reg::B8 | Reg::Q8 => Some(8),
+        Reg::V9 | Reg::D9 | Reg::S9 | Reg::H9 | Reg::B9 | Reg::Q9 => Some(9),
+        Reg::V10 | Reg::D10 | Reg::S10 | Reg::H10 | Reg::B10 | Reg::Q10 => Some(10),
+        Reg::V11 | Reg::D11 | Reg::S11 | Reg::H11 | Reg::B11 | Reg::Q11 => Some(11),
+        Reg::V12 | Reg::D12 | Reg::S12 | Reg::H12 | Reg::B12 | Reg::Q12 => Some(12),
+        Reg::V13 | Reg::D13 | Reg::S13 | Reg::H13 | Reg::B13 | Reg::Q13 => Some(13),
+        Reg::V14 | Reg::D14 | Reg::S14 | Reg::H14 | Reg::B14 | Reg::Q14 => Some(14),
+        Reg::V15 | Reg::D15 | Reg::S15 | Reg::H15 | Reg::B15 | Reg::Q15 => Some(15),
+        Reg::V16 | Reg::D16 | Reg::S16 | Reg::H16 | Reg::B16 | Reg::Q16 => Some(16),
+        Reg::V17 | Reg::D17 | Reg::S17 | Reg::H17 | Reg::B17 | Reg::Q17 => Some(17),
+        Reg::V18 | Reg::D18 | Reg::S18 | Reg::H18 | Reg::B18 | Reg::Q18 => Some(18),
+        Reg::V19 | Reg::D19 | Reg::S19 | Reg::H19 | Reg::B19 | Reg::Q19 => Some(19),
+        Reg::V20 | Reg::D20 | Reg::S20 | Reg::H20 | Reg::B20 | Reg::Q20 => Some(20),
+        Reg::V21 | Reg::D21 | Reg::S21 | Reg::H21 | Reg::B21 | Reg::Q21 => Some(21),
+        Reg::V22 | Reg::D22 | Reg::S22 | Reg::H22 | Reg::B22 | Reg::Q22 => Some(22),
+        Reg::V23 | Reg::D23 | Reg::S23 | Reg::H23 | Reg::B23 | Reg::Q23 => Some(23),
+        Reg::V24 | Reg::D24 | Reg::S24 | Reg::H24 | Reg::B24 | Reg::Q24 => Some(24),
+        Reg::V25 | Reg::D25 | Reg::S25 | Reg::H25 | Reg::B25 | Reg::Q25 => Some(25),
+        Reg::V26 | Reg::D26 | Reg::S26 | Reg::H26 | Reg::B26 | Reg::Q26 => Some(26),
+        Reg::V27 | Reg::D27 | Reg::S27 | Reg::H27 | Reg::B27 | Reg::Q27 => Some(27),
+        Reg::V28 | Reg::D28 | Reg::S28 | Reg::H28 | Reg::B28 | Reg::Q28 => Some(28),
+        Reg::V29 | Reg::D29 | Reg::S29 | Reg::H29 | Reg::B29 | Reg::Q29 => Some(29),
+        Reg::V30 | Reg::D30 | Reg::S30 | Reg::H30 | Reg::B30 | Reg::Q30 => Some(30),
+        Reg::V31 | Reg::D31 | Reg::S31 | Reg::H31 | Reg::B31 | Reg::Q31 => Some(31),
+        _ => None,
+    }
+}
+
+fn get_v_reg_offset(reg: Reg) -> Option<i32> {
+    v_reg_idx(reg).map(|idx| (272 + idx * 16) as i32)
+}
+
+fn load_v_f64(builder: &mut FunctionBuilder, ctx_ptr: Value, reg: Reg) -> Value {
+    if let Some(off) = get_v_reg_offset(reg) {
+        builder.ins().load(types::F64, MemFlags::trusted(), ctx_ptr, off)
+    } else {
+        builder.ins().f64const(0.0)
+    }
+}
+
+fn store_v_f64(builder: &mut FunctionBuilder, ctx_ptr: Value, reg: Reg, val: Value) {
+    if let Some(off) = get_v_reg_offset(reg) {
+        builder.ins().store(MemFlags::trusted(), val, ctx_ptr, off);
+        let zero64 = builder.ins().iconst(types::I64, 0);
+        builder.ins().store(MemFlags::trusted(), zero64, ctx_ptr, off + 8);
+    }
+}
+
 fn reg_idx(reg: Reg) -> Option<usize> {
     match reg {
         Reg::X0 | Reg::W0 => Some(0),
@@ -431,6 +489,77 @@ impl JitEngine {
                         let res_pc = builder.ins().select(cond, ret_target, ret_next);
                         builder.ins().return_(&[res_pc]);
                         ended_block = true;
+                        compiled_any = true;
+                    }
+                }
+                Op::FADD => {
+                    if let (Some(vd), Some(vn), Some(vm)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg), operands.get(2).and_then(get_op_reg)) {
+                        let val_n = load_v_f64(&mut builder, ctx_ptr, vn);
+                        let val_m = load_v_f64(&mut builder, ctx_ptr, vm);
+                        let res = builder.ins().fadd(val_n, val_m);
+                        store_v_f64(&mut builder, ctx_ptr, vd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::FSUB => {
+                    if let (Some(vd), Some(vn), Some(vm)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg), operands.get(2).and_then(get_op_reg)) {
+                        let val_n = load_v_f64(&mut builder, ctx_ptr, vn);
+                        let val_m = load_v_f64(&mut builder, ctx_ptr, vm);
+                        let res = builder.ins().fsub(val_n, val_m);
+                        store_v_f64(&mut builder, ctx_ptr, vd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::FMUL => {
+                    if let (Some(vd), Some(vn), Some(vm)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg), operands.get(2).and_then(get_op_reg)) {
+                        let val_n = load_v_f64(&mut builder, ctx_ptr, vn);
+                        let val_m = load_v_f64(&mut builder, ctx_ptr, vm);
+                        let res = builder.ins().fmul(val_n, val_m);
+                        store_v_f64(&mut builder, ctx_ptr, vd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::FDIV => {
+                    if let (Some(vd), Some(vn), Some(vm)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg), operands.get(2).and_then(get_op_reg)) {
+                        let val_n = load_v_f64(&mut builder, ctx_ptr, vn);
+                        let val_m = load_v_f64(&mut builder, ctx_ptr, vm);
+                        let res = builder.ins().fdiv(val_n, val_m);
+                        store_v_f64(&mut builder, ctx_ptr, vd, res);
+                        compiled_any = true;
+                    }
+                }
+                Op::FMOV => {
+                    if let (Some(rd), Some(rn)) = (operands.get(0).and_then(get_op_reg), operands.get(1).and_then(get_op_reg)) {
+                        if v_reg_idx(rd).is_some() && v_reg_idx(rn).is_some() {
+                            let val_n = load_v_f64(&mut builder, ctx_ptr, rn);
+                            store_v_f64(&mut builder, ctx_ptr, rd, val_n);
+                            compiled_any = true;
+                        } else if v_reg_idx(rd).is_some() {
+                            let val_n = load_reg(&mut builder, ctx_ptr, rn);
+                            let fval = builder.ins().bitcast(types::F64, MemFlags::trusted(), val_n);
+                            store_v_f64(&mut builder, ctx_ptr, rd, fval);
+                            compiled_any = true;
+                        } else if v_reg_idx(rn).is_some() {
+                            let val_n = load_v_f64(&mut builder, ctx_ptr, rn);
+                            let ival = builder.ins().bitcast(types::I64, MemFlags::trusted(), val_n);
+                            store_reg(&mut builder, ctx_ptr, rd, ival);
+                            compiled_any = true;
+                        }
+                    }
+                }
+                Op::MRS => {
+                    if let Some(rt) = operands.first().and_then(get_op_reg) {
+                        let tpidr_off = 784i32;
+                        let tpidr_val = builder.ins().load(types::I64, MemFlags::trusted(), ctx_ptr, tpidr_off);
+                        store_reg(&mut builder, ctx_ptr, rt, tpidr_val);
+                        compiled_any = true;
+                    }
+                }
+                Op::MSR => {
+                    if let Some(rt) = operands.get(1).and_then(get_op_reg) {
+                        let val_t = load_reg(&mut builder, ctx_ptr, rt);
+                        let tpidr_off = 784i32;
+                        builder.ins().store(MemFlags::trusted(), val_t, ctx_ptr, tpidr_off);
                         compiled_any = true;
                     }
                 }
