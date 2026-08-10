@@ -19,11 +19,17 @@ impl MachOLoader {
         let file = object::File::parse(&*data)
             .map_err(|e| Error::LoadError(format!("Mach-O parse error: {}", e)))?;
 
-        let is_pie = true;
-        let load_bias: u64 = if is_pie { 0x100000000 } else { 0 };
+        let first_seg_addr = file.segments().next().map(|s| s.address()).unwrap_or(0);
+        let load_bias: u64 = if first_seg_addr == 0 { 0x100000000 } else { 0 };
 
-        let entry_point = file.entry() + load_bias;
-        tracing::info!("[Mach-O Loader] Entry point: {:#x} (load_bias: {:#x})", entry_point, load_bias);
+        let raw_entry = file.entry();
+        let entry_point = if raw_entry < first_seg_addr {
+            first_seg_addr + raw_entry
+        } else {
+            raw_entry
+        } + load_bias;
+
+        tracing::info!("[Mach-O Loader] Entry point: {:#x} (first_seg: {:#x}, load_bias: {:#x})", entry_point, first_seg_addr, load_bias);
 
         let mut max_vaddr: u64 = 0;
 

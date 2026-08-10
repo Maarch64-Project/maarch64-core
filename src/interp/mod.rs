@@ -2790,7 +2790,7 @@ impl Interpreter {
                 // Do nothing (Pointer Authentication & BTI hint instructions)
             }
             Op::SVC => {
-                SyscallDispatcher::handle_syscall(ctx, mem)?;
+                SyscallDispatcher::handle_syscall_for_os(ctx.target_os, ctx, mem)?;
                 if ctx.exited {
                     return Ok(false);
                 }

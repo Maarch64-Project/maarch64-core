@@ -20,6 +20,8 @@ pub struct CpuContext {
     pub exited: bool,
     /// Process exit status code
     pub exit_code: i32,
+    /// Target Operating System
+    pub target_os: crate::loader::TargetOs,
 }
 
 pub const FLAG_N: u32 = 1 << 31;

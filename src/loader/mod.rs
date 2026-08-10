@@ -4,8 +4,9 @@ use std::path::Path;
 
 pub mod macho;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TargetOs {
+    #[default]
     Linux,
     Darwin,
     Android,
