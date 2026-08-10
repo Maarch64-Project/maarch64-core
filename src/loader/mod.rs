@@ -91,61 +91,107 @@ impl ElfLoader {
         let _ = mem.write(0x7f010300, &1u32.to_le_bytes());
         let _ = mem.write(0x7f010310, &1u32.to_le_bytes());
 
-        if load_bias > 0 {
-            use object::{Object, ObjectSegment, ObjectSymbol};
-            let dyn_syms: Vec<_> = file.dynamic_symbols().collect();
-            if let Some(relocs) = file.dynamic_relocations() {
-                let mut reloc_count = 0;
-                let mut symbol_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        use object::{Object, ObjectSegment, ObjectSymbol};
+        let dyn_syms: Vec<_> = file.dynamic_symbols().collect();
+        if let Some(relocs) = file.dynamic_relocations() {
+            let mut reloc_count = 0;
+            let mut symbol_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
-                for (addr, reloc) in relocs {
-                    let target_addr = addr + load_bias;
-                    let target = reloc.target();
-                    if let object::RelocationTarget::Symbol(sym_idx) = target {
-                        if let Some(sym) = dyn_syms.get(sym_idx.0) {
-                            if sym.is_undefined() {
-                                if let Ok(name) = sym.name() {
-                                    if !name.is_empty() {
-                                        let data_sym_val: u64 = match name {
-                                            "stdout" => 0x7f010000,
-                                            "stderr" => 0x7f010100,
-                                            "stdin" => 0x7f010200,
-                                            "optind" => 0x7f010300,
-                                            "optarg" => 0x7f010308,
-                                            "opterr" => 0x7f010310,
-                                            "optopt" => 0x7f010318,
-                                            "environ" => 0x7f010400,
-                                            _ => 0,
-                                        };
-                                        if data_sym_val != 0 {
-                                            let _ = mem.write(target_addr, &data_sym_val.to_le_bytes());
-                                            continue;
-                                        }
-
-                                        let next_idx = symbol_map.len() as u64;
-                                        let tramp_addr = *symbol_map.entry(name.to_string()).or_insert_with(|| {
-                                            let a = 0x7f000000 + next_idx * 8;
-                                            dynamic_thunks.push((a, name.to_string()));
-                                            a
-                                        });
-                                        let _ = mem.write(target_addr, &tramp_addr.to_le_bytes());
+            for (addr, reloc) in relocs {
+                let target_addr = addr + load_bias;
+                let target = reloc.target();
+                if let object::RelocationTarget::Symbol(sym_idx) = target {
+                    let sym_opt = dyn_syms.iter().find(|s| s.index() == sym_idx);
+                    if let Some(sym) = sym_opt {
+                        if sym.is_undefined() {
+                            if let Ok(name) = sym.name() {
+                                if !name.is_empty() {
+                                    let data_sym_val: u64 = match name {
+                                        "stdout" => 0x7f010000,
+                                        "stderr" => 0x7f010100,
+                                        "stdin" => 0x7f010200,
+                                        "optind" => 0x7f010300,
+                                        "optarg" => 0x7f010308,
+                                        "opterr" => 0x7f010310,
+                                        "optopt" => 0x7f010318,
+                                        "environ" => 0x7f010400,
+                                        _ => 0,
+                                    };
+                                    if data_sym_val != 0 {
+                                        let _ = mem.write(target_addr, &data_sym_val.to_le_bytes());
                                         continue;
                                     }
+
+                                    let next_idx = symbol_map.len() as u64;
+                                    let tramp_addr = *symbol_map.entry(name.to_string()).or_insert_with(|| {
+                                        let a = 0x7f000000 + next_idx * 8;
+                                        dynamic_thunks.push((a, name.to_string()));
+                                        a
+                                    });
+                                    let _ = mem.write(target_addr, &tramp_addr.to_le_bytes());
+                                    continue;
                                 }
-                            } else if sym.address() != 0 {
-                                let addend = reloc.addend() as u64;
-                                let val = sym.address() + load_bias + addend;
-                                let _ = mem.write(target_addr, &val.to_le_bytes());
-                                reloc_count += 1;
-                                continue;
+                            }
+                        } else if sym.address() != 0 {
+                            let addend = reloc.addend() as u64;
+                            let val = sym.address() + load_bias + addend;
+                            let _ = mem.write(target_addr, &val.to_le_bytes());
+                            reloc_count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                let addend = reloc.addend() as u64;
+                let val = load_bias.wrapping_add(addend);
+                if target_addr == 0x41fef8 {
+                    tracing::info!("[TARGET_ADDR 0x41fef8] relative/other val={:#x}", val);
+                }
+                let _ = mem.write(target_addr, &val.to_le_bytes());
+                reloc_count += 1;
+            }
+        }
+
+        // Handle SHT_RELR / DT_RELR packed relative relocations if present
+        if let object::File::Elf64(elf) = &file {
+            use object::elf::*;
+            use object::read::elf::SectionHeader;
+            let endian = elf.endian();
+            let sections = elf.elf_section_table();
+            for section in sections.iter() {
+                if section.sh_type(endian) == SHT_RELR {
+                    if let Ok(data) = section.data(endian, elf.data()) {
+                        let mut base_addr: u64 = 0;
+                        for chunk in data.chunks_exact(8) {
+                            let entry = u64::from_le_bytes(chunk.try_into().unwrap());
+                            if entry & 1 == 0 {
+                                base_addr = entry;
+                                let target_addr = base_addr + load_bias;
+                                if let Ok(existing) = mem.read(target_addr, 8) {
+                                    let curr_val = u64::from_le_bytes(existing.try_into().unwrap());
+                                    let new_val = curr_val.wrapping_add(load_bias);
+                                    let _ = mem.write(target_addr, &new_val.to_le_bytes());
+                                }
+                                base_addr += 8;
+                            } else {
+                                let mut bitmap = entry >> 1;
+                                let mut addr = base_addr;
+                                while bitmap != 0 {
+                                    if bitmap & 1 != 0 {
+                                        let target_addr = addr + load_bias;
+                                        if let Ok(existing) = mem.read(target_addr, 8) {
+                                            let curr_val = u64::from_le_bytes(existing.try_into().unwrap());
+                                            let new_val = curr_val.wrapping_add(load_bias);
+                                            let _ = mem.write(target_addr, &new_val.to_le_bytes());
+                                        }
+                                    }
+                                    bitmap >>= 1;
+                                    addr += 8;
+                                }
+                                base_addr += 63 * 8;
                             }
                         }
                     }
-
-                    let addend = reloc.addend() as u64;
-                    let val = load_bias.wrapping_add(addend);
-                    let _ = mem.write(target_addr, &val.to_le_bytes());
-                    reloc_count += 1;
                 }
             }
         }
