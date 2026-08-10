@@ -45,7 +45,19 @@ impl ElfLoader {
         let is_pie = file.segments().next().map(|s| s.address()).unwrap_or(0) == 0;
         let load_bias: u64 = if is_pie { 0x400000 } else { 0 };
 
-        let entry_point = file.entry() + load_bias;
+        let mut entry_point = file.entry() + load_bias;
+        if file.entry() == 0 {
+            use object::ObjectSymbol;
+            for sym in file.symbols().chain(file.dynamic_symbols()) {
+                if let Ok(name) = sym.name() {
+                    if name == "main" || name == "JNI_OnLoad" || name == "ANativeActivity_onCreate" {
+                        entry_point = sym.address() + load_bias;
+                        tracing::info!("Found exported shared library entry symbol '{}' at {:#x}", name, entry_point);
+                        break;
+                    }
+                }
+            }
+        }
         tracing::info!("ELF Entry point: {:#x} (load_bias: {:#x})", entry_point, load_bias);
 
         let mut max_vaddr: u64 = 0;
